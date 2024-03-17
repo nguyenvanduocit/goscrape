@@ -1,0 +1,17 @@
+*.db
+*.dmp
+*.exe
+*.iml
+*.local
+*.out
+*.prof
+*.test
+.DS_Store
+.fleet
+.idea
+.vscode
+/*.log
+
+.testCoverage
+dist/
+goscrape
