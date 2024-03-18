@@ -21,14 +21,6 @@ universal_binaries:
 archives:
   - id: goscrape
     builds: ['goscrape']
-    name_template: >-
-      {{ .ProjectName }}_v{{ .Version }}_
-      {{- if eq .Os "darwin" }}macos
-      {{- else }}{{ .Os }}{{ end }}_
-      {{- if eq .Arch "amd64" }}64bit
-      {{- else if eq .Arch "386" }}32bit
-      {{- else if eq .Arch "Darwin" }}macos
-      {{- else }}{{ .Arch }}{{ end }}
     format_overrides:
       - goos: windows
         format: zip
