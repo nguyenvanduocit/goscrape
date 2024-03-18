@@ -37,7 +37,7 @@ type arguments struct {
 
 	Verbose bool `arg:"-v,--verbose" help:"verbose output"`
 
-	SkipExternalResources bool `arg:"-e,--skill-external-resources" help:"skill external resources, only scrape the main page"`
+	SkipExternalResources bool `arg:"--skip-external-resources" help:"skill external resources, only scrape the main page"`
 }
 
 func (arguments) Description() string {
@@ -116,10 +116,6 @@ func run(ctx context.Context, args arguments) error {
 	logger, err := createLogger()
 	if err != nil {
 		return fmt.Errorf("creating logger: %w", err)
-	}
-
-	if args.SkipExternalResources {
-		logger.Info("Skipping external resources")
 	}
 
 	cfg := scraper.Config{

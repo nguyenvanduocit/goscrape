@@ -66,7 +66,6 @@ func (s *Scraper) isURLIncluded(url *url.URL) bool {
 }
 
 func (s *Scraper) isURLExcluded(url *url.URL) bool {
-
 	if url.Host != s.URL.Host {
 		s.logger.Info("Skipping URL from different domain",
 			log.String("url", url.String()))

@@ -64,7 +64,6 @@ func (h *Index) Index(baseURL *url.URL, node *html.Node) {
 		// Recurse into the child node
 		h.Index(baseURL, child)
 	}
-
 }
 
 // URLs returns all URLs of the references found for a specific tag.

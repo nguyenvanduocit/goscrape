@@ -1,5 +1,9 @@
 # goscrape - create offline browsable copies of websites
 
+## Fork note
+
+I forked this because I found the original repository to be stable, and the changes I made did not align with the goals of the original repository. I want to create a tool to serve the prerendering of WordPress websites, not entirely for offline reading.
+
 [![Build status](https://github.com/cornelk/goscrape/actions/workflows/go.yaml/badge.svg?branch=main)](https://github.com/cornelk/goscrape/actions)
 [![go.dev reference](https://img.shields.io/badge/go.dev-reference-007d9c?logo=go&logoColor=white&style=flat-square)](https://pkg.go.dev/github.com/cornelk/goscrape)
 [![Go Report Card](https://goreportcard.com/badge/github.com/cornelk/goscrape)](https://goreportcard.com/report/github.com/cornelk/goscrape)
@@ -74,5 +78,6 @@ Options:
   --useragent USERAGENT, -a USERAGENT 
                          user agent to use for scraping
   --verbose, -v          verbose output
+  --skip-external-resources skip downloading resources from external domains, only scrape the main page
   --help, -h             display this help and exit
 ```
