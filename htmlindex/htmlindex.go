@@ -41,6 +41,7 @@ func (h *Index) Index(baseURL *url.URL, node *html.Node) {
 
 		case "script":
 			references = nodeURL(baseURL, "src", child)
+
 		default:
 			if node.FirstChild != nil {
 				h.Index(baseURL, child)

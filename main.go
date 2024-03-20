@@ -145,7 +145,8 @@ func run(ctx context.Context, args arguments) error {
 				os.Exit(0)
 			}
 
-			return fmt.Errorf("scraping '%s': %w", sc.URL, err)
+			logger.Error("Scraping failed", log.Err(err))
+			continue
 		}
 	}
 
