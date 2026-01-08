@@ -58,8 +58,47 @@ func (idx *Index) indexElementNode(baseURL *url.URL, node, child *html.Node) {
 		m[reference] = append(m[reference], child)
 	}
 
+	// Process inline style attribute on all elements.
+	idx.indexInlineStyle(baseURL, child)
+
 	if node.FirstChild != nil && !info.noChildParsing {
 		idx.Index(baseURL, child)
+	}
+}
+
+// indexInlineStyle extracts URLs from inline style attributes.
+func (idx *Index) indexInlineStyle(baseURL *url.URL, node *html.Node) {
+	for _, attr := range node.Attr {
+		if attr.Key != InlineStyleAttr {
+			continue
+		}
+
+		data := nodeAttributeParserData{
+			logger: idx.logger,
+			url:    baseURL,
+			node:   node,
+			value:  strings.TrimSpace(attr.Val),
+		}
+		urls := inlineStyleParser(data)
+		if len(urls) == 0 {
+			return
+		}
+
+		m, ok := idx.data[InlineStyleTag]
+		if !ok {
+			m = map[string][]*html.Node{}
+			idx.data[InlineStyleTag] = m
+		}
+
+		for _, rawURL := range urls {
+			ur, err := url.Parse(rawURL)
+			if err != nil {
+				continue
+			}
+			resolved := baseURL.ResolveReference(ur)
+			m[resolved.String()] = append(m[resolved.String()], node)
+		}
+		return
 	}
 }
 
@@ -187,4 +226,20 @@ func styleParser(data nodeAttributeParserData) ([]string, bool) {
 	css.Process(data.logger, data.url, cssData, processor)
 
 	return urls, true
+}
+
+// inlineStyleParser returns the URL values from an inline style attribute.
+func inlineStyleParser(data nodeAttributeParserData) []string {
+	if data.value == "" {
+		return nil
+	}
+
+	var urls []string
+	processor := func(_ *css.Token, _ string, url *url.URL) {
+		urls = append(urls, url.String())
+	}
+
+	css.Process(data.logger, data.url, data.value, processor)
+
+	return urls
 }

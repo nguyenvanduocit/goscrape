@@ -193,3 +193,62 @@ h3 {
 	assert.Contains(t, content, "url('"+file2Reference+"')")
 	assert.Contains(t, content, "url("+file3Reference+")")
 }
+
+func TestScraperInlineStyleAttribute(t *testing.T) {
+	indexPage := []byte(`
+<html>
+<head>
+</head>
+<body>
+<div style="background-image: url('https://example.org/hero.jpg')">
+  <section style="background: url('/img/section-bg.png') no-repeat">
+    <p style="color: red">No URL here</p>
+  </section>
+</div>
+<span style="background-image: url(icon.gif)"></span>
+</body>
+</html>
+`)
+	empty := []byte(``)
+
+	domain := "example.org"
+	file1Reference := "hero.jpg"
+	file2Reference := "img/section-bg.png"
+	file3Reference := "icon.gif"
+	fullURL := "https://" + domain
+
+	urls := map[string][]byte{
+		fullURL + "/":                  indexPage,
+		fullURL + "/" + file1Reference: empty,
+		fullURL + "/" + file2Reference: empty,
+		fullURL + "/" + file3Reference: empty,
+	}
+
+	scraper := newTestScraper(t, fullURL+"/", urls)
+	require.NotNil(t, scraper)
+
+	files := map[string][]byte{}
+	scraper.fileWriter = func(filePath string, data []byte) error {
+		files[filePath] = data
+		return nil
+	}
+
+	ctx := context.Background()
+	err := scraper.Start(ctx)
+	require.NoError(t, err)
+
+	expectedProcessed := set.NewFromSlice([]string{
+		"/",
+		"/" + file1Reference,
+		"/" + file2Reference,
+		"/" + file3Reference,
+	})
+	require.Equal(t, expectedProcessed, scraper.processed)
+
+	ref := domain + "/index.html"
+	content := string(files[ref])
+	// HTML renderer escapes single quotes to &#39; in attributes.
+	assert.Contains(t, content, "url(&#39;"+file1Reference+"&#39;)")
+	assert.Contains(t, content, "url(&#39;"+file2Reference+"&#39;)")
+	assert.Contains(t, content, "url("+file3Reference+")")
+}

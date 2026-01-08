@@ -83,6 +83,7 @@ goscrape --serve website.com
   --useragent USERAGENT, -a USERAGENT
                          user agent to use for scraping
   --verbose, -v          verbose output
+  --include-external, -e include external resources from other domains
   --help, -h             display this help and exit
   --version              display version and exit
 ```

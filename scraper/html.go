@@ -52,7 +52,7 @@ func (s *Scraper) fixHTMLNodeURLs(baseURL *url.URL, relativeToRoot string, index
 			for _, node := range nodes {
 				switch node.Data {
 				case htmlindex.StyleTag:
-					if s.fixScriptNodeURL(baseURL, node, isHyperlink, relativeToRoot) {
+					if s.fixStyleTagURL(baseURL, node, isHyperlink, relativeToRoot) {
 						changed = true
 					}
 				default:
@@ -60,6 +60,16 @@ func (s *Scraper) fixHTMLNodeURLs(baseURL *url.URL, relativeToRoot string, index
 						changed = true
 					}
 				}
+			}
+		}
+	}
+
+	// Fix inline style attributes.
+	urls := index.Nodes(htmlindex.InlineStyleTag)
+	for _, nodes := range urls {
+		for _, node := range nodes {
+			if s.fixInlineStyleURL(baseURL, node, relativeToRoot) {
+				changed = true
 			}
 		}
 	}
@@ -114,9 +124,9 @@ func (s *Scraper) fixNodeURL(baseURL *url.URL, attributes []string, node *html.N
 	return changed
 }
 
-// fixScriptNodeURL fixes the URL references of a HTML script node to point to a relative file name.
-// It returns whether any attribute value bas been adjusted.
-func (s *Scraper) fixScriptNodeURL(baseURL *url.URL, node *html.Node,
+// fixStyleTagURL fixes the URL references of a HTML style tag to point to a relative file name.
+// It returns whether any attribute value has been adjusted.
+func (s *Scraper) fixStyleTagURL(baseURL *url.URL, node *html.Node,
 	isHyperlink bool, relativeToRoot string) bool {
 
 	if node.FirstChild == nil {
@@ -148,6 +158,44 @@ func (s *Scraper) fixScriptNodeURL(baseURL *url.URL, node *html.Node,
 	node.FirstChild.Data = cssData
 
 	return changed
+}
+
+// fixInlineStyleURL fixes the URL references in an inline style attribute.
+// It returns whether the attribute value has been adjusted.
+func (s *Scraper) fixInlineStyleURL(baseURL *url.URL, node *html.Node, relativeToRoot string) bool {
+	for i, attr := range node.Attr {
+		if attr.Key != htmlindex.InlineStyleAttr {
+			continue
+		}
+
+		urls := map[string]string{}
+
+		processor := func(_ *css.Token, before string, _ *url.URL) {
+			adjusted := resolveURL(baseURL, before, s.URL.Host, false, relativeToRoot)
+			if before != adjusted {
+				urls[before] = adjusted
+			}
+		}
+
+		css.Process(s.logger, baseURL, attr.Val, processor)
+
+		if len(urls) == 0 {
+			return false
+		}
+
+		cssData := attr.Val
+		for before, filePath := range urls {
+			cssData = replaceCSSUrls(before, filePath, cssData)
+			s.logger.Debug("Inline style relinked",
+				log.String("url", before),
+				log.String("fixed_url", filePath))
+		}
+
+		node.Attr[i].Val = cssData
+		return true
+	}
+
+	return false
 }
 
 func resolveSrcSetURLs(base *url.URL, srcSetValue, mainPageHost string, isHyperlink bool, relativeToRoot string) string {

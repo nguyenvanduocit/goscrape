@@ -42,12 +42,14 @@ const (
 
 // nolint: revive
 const (
-	ATag      = "a"
-	BodyTag   = "body"
-	ImgTag    = "img"
-	LinkTag   = "link"
-	ScriptTag = "script"
-	StyleTag  = "style"
+	ATag            = "a"
+	BodyTag         = "body"
+	ImgTag          = "img"
+	LinkTag         = "link"
+	ScriptTag       = "script"
+	StyleTag        = "style"
+	InlineStyleAttr = "style"            // attribute name for inline styles
+	InlineStyleTag  = "__inline_style__" // virtual tag to store inline style URLs
 )
 
 // Nodes describes the HTML tags and their attributes that can contain URL.

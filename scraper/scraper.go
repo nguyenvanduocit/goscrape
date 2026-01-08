@@ -10,6 +10,8 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"regexp"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cornelk/goscrape/htmlindex"
@@ -18,7 +20,10 @@ import (
 	"github.com/cornelk/gotokit/set"
 	"github.com/h2non/filetype"
 	"github.com/h2non/filetype/types"
+	"github.com/schollz/progressbar/v3"
+	"github.com/temoto/robotstxt"
 	"golang.org/x/net/html"
+	"golang.org/x/time/rate"
 )
 
 // Config contains the scraper configuration.
@@ -41,6 +46,18 @@ type Config struct {
 	UserAgent string
 
 	SkipExternalResources bool // skip external resources, only scrape URLs from the same domain
+
+	// Concurrency and rate limiting
+	Concurrency int     // number of concurrent asset downloads
+	RateLimit   float64 // max requests per second, 0 for unlimited
+	Delay       uint    // milliseconds delay between requests
+
+	// Progress and logging
+	ShowProgress bool   // show progress bar
+	ErrorLogFile string // file to log failed URLs
+
+	// robots.txt
+	RespectRobots bool // respect robots.txt rules
 }
 
 type (
@@ -49,6 +66,13 @@ type (
 	fileExistenceCheck func(filePath string) bool
 	fileWriter         func(filePath string, data []byte) error
 )
+
+// FailedURL represents a URL that failed to download.
+type FailedURL struct {
+	URL       string
+	Error     string
+	Timestamp time.Time
+}
 
 // Scraper contains all scraping data.
 type Scraper struct {
@@ -74,6 +98,20 @@ type Scraper struct {
 	fileExistenceCheck fileExistenceCheck
 	fileWriter         fileWriter
 	httpDownloader     httpDownloader
+
+	// Rate limiting
+	rateLimiter *rate.Limiter
+
+	// Progress tracking
+	progress *progressbar.ProgressBar
+	doneURLs int64 // atomic counter for completed downloads
+
+	// Error tracking
+	failedURLs   []FailedURL
+	failedURLsMu sync.Mutex
+
+	// robots.txt
+	robotsData *robotstxt.RobotsData
 }
 
 // New creates a new Scraper instance.
@@ -147,6 +185,16 @@ func New(logger *log.Logger, cfg Config) (*Scraper, error) {
 		s.auth = "Basic " + base64.StdEncoding.EncodeToString([]byte(s.config.Username+":"+s.config.Password))
 	}
 
+	// Initialize rate limiter if configured
+	if cfg.RateLimit > 0 {
+		s.rateLimiter = rate.NewLimiter(rate.Limit(cfg.RateLimit), 1)
+	}
+
+	// Set default concurrency
+	if s.config.Concurrency <= 0 {
+		s.config.Concurrency = 1
+	}
+
 	return s, nil
 }
 
@@ -154,6 +202,22 @@ func New(logger *log.Logger, cfg Config) (*Scraper, error) {
 func (s *Scraper) Start(ctx context.Context) error {
 	if err := s.dirCreator(s.config.OutputDirectory); err != nil {
 		return err
+	}
+
+	// Initialize progress bar if configured
+	if s.config.ShowProgress {
+		s.progress = progressbar.NewOptions(-1,
+			progressbar.OptionSetDescription("Downloading"),
+			progressbar.OptionShowCount(),
+			progressbar.OptionSpinnerType(14),
+			progressbar.OptionSetPredictTime(false),
+			progressbar.OptionClearOnFinish(),
+		)
+	}
+
+	// Fetch robots.txt if configured
+	if s.config.RespectRobots {
+		s.fetchRobotsTxt(ctx)
 	}
 
 	if !s.shouldURLBeDownloaded(s.URL, 0, false) {
@@ -177,6 +241,11 @@ func (s *Scraper) Start(ctx context.Context) error {
 		if err := s.processURL(ctx, ur, currentDepth+1); err != nil && errors.Is(err, context.Canceled) {
 			return err
 		}
+	}
+
+	// Finish progress bar
+	if s.progress != nil {
+		_ = s.progress.Finish()
 	}
 
 	return nil
@@ -299,4 +368,56 @@ func compileRegexps(regexps []string) ([]*regexp.Regexp, error) {
 		return nil, errors.Join(errs...)
 	}
 	return compiled, nil
+}
+
+// FailedURLs returns the list of URLs that failed to download.
+func (s *Scraper) FailedURLs() []FailedURL {
+	s.failedURLsMu.Lock()
+	defer s.failedURLsMu.Unlock()
+	return append([]FailedURL{}, s.failedURLs...)
+}
+
+// addFailedURL records a failed URL download.
+func (s *Scraper) addFailedURL(u string, err error) {
+	s.failedURLsMu.Lock()
+	defer s.failedURLsMu.Unlock()
+	s.failedURLs = append(s.failedURLs, FailedURL{
+		URL:       u,
+		Error:     err.Error(),
+		Timestamp: time.Now(),
+	})
+}
+
+// incrementProgress increments the progress counter and updates the progress bar.
+func (s *Scraper) incrementProgress() {
+	atomic.AddInt64(&s.doneURLs, 1)
+	if s.progress != nil {
+		_ = s.progress.Add(1)
+	}
+}
+
+// fetchRobotsTxt fetches and parses robots.txt for the main domain.
+func (s *Scraper) fetchRobotsTxt(ctx context.Context) {
+	robotsURL := &url.URL{
+		Scheme: s.URL.Scheme,
+		Host:   s.URL.Host,
+		Path:   "/robots.txt",
+	}
+
+	s.logger.Debug("Fetching robots.txt", log.String("url", robotsURL.String()))
+
+	data, _, err := s.downloadURLWithRetries(ctx, robotsURL)
+	if err != nil {
+		s.logger.Debug("Failed to fetch robots.txt, ignoring", log.Err(err))
+		return
+	}
+
+	robots, err := robotstxt.FromBytes(data)
+	if err != nil {
+		s.logger.Debug("Failed to parse robots.txt, ignoring", log.Err(err))
+		return
+	}
+
+	s.robotsData = robots
+	s.logger.Debug("Loaded robots.txt successfully")
 }

@@ -46,7 +46,19 @@ type arguments struct {
 
 	Verbose bool `arg:"-v,--verbose" help:"verbose output"`
 
-	SkipExternalResources bool `arg:"-e,--skip-external" help:"skip external resources, only scrape URLs from the same domain"`
+	IncludeExternal bool `arg:"-e,--include-external" help:"include external resources from other domains"`
+
+	// Concurrency and rate limiting
+	Concurrency int     `arg:"-j,--concurrency" help:"number of concurrent asset downloads" default:"4"`
+	RateLimit   float64 `arg:"--rate-limit" help:"max requests per second, 0 for unlimited" default:"0"`
+	Delay       int64   `arg:"--delay" help:"milliseconds delay between requests" default:"0"`
+
+	// Progress and logging
+	NoProgress   bool   `arg:"--no-progress" help:"disable progress bar"`
+	ErrorLogFile string `arg:"--error-log" help:"file to log failed URLs"`
+
+	// robots.txt
+	RespectRobots bool `arg:"--respect-robots" help:"respect robots.txt rules"`
 }
 
 func (arguments) Description() string {
@@ -158,7 +170,19 @@ func runScraper(ctx context.Context, args arguments, logger *log.Logger) error {
 		Proxy:     args.Proxy,
 		UserAgent: args.UserAgent,
 
-		SkipExternalResources: args.SkipExternalResources,
+		SkipExternalResources: !args.IncludeExternal,
+
+		// Concurrency and rate limiting
+		Concurrency: args.Concurrency,
+		RateLimit:   args.RateLimit,
+		Delay:       uint(args.Delay),
+
+		// Progress and logging
+		ShowProgress: !args.NoProgress,
+		ErrorLogFile: args.ErrorLogFile,
+
+		// robots.txt
+		RespectRobots: args.RespectRobots,
 	}
 
 	return scrapeURLs(ctx, cfg, logger, args)
@@ -186,6 +210,13 @@ func scrapeURLs(ctx context.Context, cfg scraper.Config,
 		if args.SaveCookieFile != "" {
 			if err := saveCookies(args.SaveCookieFile, sc.Cookies()); err != nil {
 				return fmt.Errorf("saving cookies: %w", err)
+			}
+		}
+
+		// Write failed URLs to error log file
+		if args.ErrorLogFile != "" {
+			if err := writeErrorLog(args.ErrorLogFile, sc.FailedURLs()); err != nil {
+				return fmt.Errorf("writing error log: %w", err)
 			}
 		}
 	}
@@ -244,6 +275,27 @@ func saveCookies(cookieFile string, cookies []scraper.Cookie) error {
 
 	if err := os.WriteFile(cookieFile, b, 0644); err != nil {
 		return fmt.Errorf("saving cookies: %w", err)
+	}
+
+	return nil
+}
+
+func writeErrorLog(errorLogFile string, failedURLs []scraper.FailedURL) error {
+	if len(failedURLs) == 0 {
+		return nil
+	}
+
+	f, err := os.OpenFile(errorLogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("opening error log file: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	for _, failed := range failedURLs {
+		line := fmt.Sprintf("%s\t%s\t%s\n", failed.Timestamp.Format("2006-01-02 15:04:05"), failed.URL, failed.Error)
+		if _, err := f.WriteString(line); err != nil {
+			return fmt.Errorf("writing to error log: %w", err)
+		}
 	}
 
 	return nil

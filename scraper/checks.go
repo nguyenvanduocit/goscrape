@@ -67,6 +67,18 @@ func (s *Scraper) shouldURLBeDownloaded(url *url.URL, currentDepth uint, isAsset
 		return false
 	}
 
+	// Check robots.txt rules if enabled (only for same domain)
+	if s.robotsData != nil && url.Host == s.URL.Host {
+		agent := s.config.UserAgent
+		if agent == "" {
+			agent = "*"
+		}
+		if !s.robotsData.TestAgent(url.Path, agent) {
+			s.logger.Debug("Blocked by robots.txt", log.String("url", url.String()))
+			return false
+		}
+	}
+
 	s.logger.Debug("New URL to download", log.String("url", url.String()))
 	return true
 }

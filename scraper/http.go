@@ -20,6 +20,15 @@ var (
 	retryDelay = 1500 * time.Millisecond
 
 	errExhaustedRetries = errors.New("exhausted retries")
+
+	// retryableStatusCodes are HTTP status codes that should trigger a retry.
+	retryableStatusCodes = map[int]bool{
+		http.StatusTooManyRequests:     true, // 429
+		http.StatusInternalServerError: true, // 500
+		http.StatusBadGateway:          true, // 502
+		http.StatusServiceUnavailable:  true, // 503
+		http.StatusGatewayTimeout:      true, // 504
+	}
 )
 
 func (s *Scraper) downloadURL(ctx context.Context, u *url.URL) (*http.Response, error) {
@@ -48,6 +57,20 @@ func (s *Scraper) downloadURL(ctx context.Context, u *url.URL) (*http.Response, 
 }
 
 func (s *Scraper) downloadURLWithRetries(ctx context.Context, u *url.URL) ([]byte, *url.URL, error) {
+	// Apply rate limiting if configured
+	if s.rateLimiter != nil {
+		if err := s.rateLimiter.Wait(ctx); err != nil {
+			return nil, nil, fmt.Errorf("rate limiter: %w", err)
+		}
+	}
+
+	// Apply delay if configured
+	if s.config.Delay > 0 {
+		if err := app.Sleep(ctx, time.Duration(s.config.Delay)*time.Millisecond); err != nil {
+			return nil, nil, fmt.Errorf("delay: %w", err)
+		}
+	}
+
 	var err error
 	var resp *http.Response
 
@@ -61,9 +84,10 @@ func (s *Scraper) downloadURLWithRetries(ctx context.Context, u *url.URL) ([]byt
 			return nil, nil, err
 		}
 
-		if resp.StatusCode == http.StatusTooManyRequests {
-			s.logger.Warn("Too Many Requests. Retrying again",
-				log.Int("num", retries+1),
+		if retryableStatusCodes[resp.StatusCode] {
+			s.logger.Warn("Retryable HTTP status. Retrying",
+				log.Int("status", resp.StatusCode),
+				log.Int("retry", retries+1),
 				log.Int("max", maxRetries),
 				log.String("url", u.String()))
 

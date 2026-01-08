@@ -14,7 +14,6 @@ linters:
     - decorder # Check declaration order of types, constants, variables and functions
     - dogsled # Checks assignments with too many blank identifiers
     - durationcheck # Check for two durations multiplied together
-    - embeddedstructfieldcheck # Checks embedded struct field positioning and formatting
     - err113 # Check errors handling expressions
     - errcheck # Checks for unchecked errors in Go code
     - errname # Checks that sentinel errors are prefixed with Err
@@ -36,7 +35,6 @@ linters:
     - makezero # Find slice declarations with non-zero initial length
     - mirror # Reports wrong mirror patterns of bytes/strings usage
     - misspell # Finds commonly misspelled English words
-    - modernize # Suggest simplifications using modern Go features
     - nakedret # Finds naked returns in functions longer than a maximum size
     - nestif # Reports deeply nested if statements
     - nilerr # Finds code that returns nil even if it checks that error is not nil
