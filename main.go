@@ -45,6 +45,8 @@ type arguments struct {
 	UserAgent string   `arg:"-a,--useragent" help:"user agent to use for scraping"`
 
 	Verbose bool `arg:"-v,--verbose" help:"verbose output"`
+
+	SkipExternalResources bool `arg:"-e,--skip-external" help:"skip external resources, only scrape URLs from the same domain"`
 }
 
 func (arguments) Description() string {
@@ -155,6 +157,8 @@ func runScraper(ctx context.Context, args arguments, logger *log.Logger) error {
 		Header:    scraper.Headers(args.Headers),
 		Proxy:     args.Proxy,
 		UserAgent: args.UserAgent,
+
+		SkipExternalResources: args.SkipExternalResources,
 	}
 
 	return scrapeURLs(ctx, cfg, logger, args)

@@ -39,6 +39,8 @@ type Config struct {
 	Header    http.Header
 	Proxy     string
 	UserAgent string
+
+	SkipExternalResources bool // skip external resources, only scrape URLs from the same domain
 }
 
 type (
@@ -166,6 +168,12 @@ func (s *Scraper) Start(ctx context.Context) error {
 		ur := s.webPageQueue[0]
 		s.webPageQueue = s.webPageQueue[1:]
 		currentDepth := s.webPageQueueDepth[ur.String()]
+
+		if s.config.SkipExternalResources && ur.Host != s.URL.Host {
+			s.logger.Debug("Skipping external resource", log.String("url", ur.String()))
+			continue
+		}
+
 		if err := s.processURL(ctx, ur, currentDepth+1); err != nil && errors.Is(err, context.Canceled) {
 			return err
 		}
