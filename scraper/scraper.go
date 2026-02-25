@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -88,11 +89,14 @@ type Scraper struct {
 	excludes []*regexp.Regexp
 
 	// key is the URL of page or asset
-	processed set.Set[string]
+	processed   set.Set[string]
+	processedMu sync.Mutex // protects processed set during concurrent access
 
 	imagesQueue       []*url.URL
+	assetsMu          sync.Mutex // protects imagesQueue during concurrent access
 	webPageQueue      []*url.URL
 	webPageQueueDepth map[string]uint
+	webPageMu         sync.Mutex // protects webPageQueue and webPageQueueDepth
 
 	dirCreator         dirCreator
 	fileExistenceCheck fileExistenceCheck
@@ -115,7 +119,7 @@ type Scraper struct {
 }
 
 // New creates a new Scraper instance.
-// nolint: funlen
+// nolint: funlen,cyclop
 func New(logger *log.Logger, cfg Config) (*Scraper, error) {
 	var errs []error
 
@@ -152,6 +156,35 @@ func New(logger *log.Logger, cfg Config) (*Scraper, error) {
 	transport, err := httpclient.ProxyTransportFromConfig(cfg.Proxy)
 	if err != nil {
 		return nil, fmt.Errorf("creating proxy transport: %w", err)
+	}
+
+	// Wrap dialer to block requests to private/loopback addresses (SSRF protection).
+	// The main scrape target host is always user-provided and trusted.
+	targetHost := u.Hostname()
+	originalDialer := &net.Dialer{Timeout: 30 * time.Second}
+	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("splitting host:port: %w", err)
+		}
+		// Allow connections to the main scrape target (or skip check if no target configured)
+		if targetHost == "" || host == targetHost {
+			return originalDialer.DialContext(ctx, network, net.JoinHostPort(host, port))
+		}
+		ips, err := net.DefaultResolver.LookupHost(ctx, host)
+		if err != nil {
+			return nil, fmt.Errorf("resolving host: %w", err)
+		}
+		for _, ipStr := range ips {
+			ip := net.ParseIP(ipStr)
+			if ip == nil {
+				continue
+			}
+			if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+				return nil, fmt.Errorf("blocked request to private/internal address: %s (%s)", host, ipStr)
+			}
+		}
+		return originalDialer.DialContext(ctx, network, net.JoinHostPort(host, port))
 	}
 
 	client := &http.Client{
@@ -230,13 +263,9 @@ func (s *Scraper) Start(ctx context.Context) error {
 
 	for len(s.webPageQueue) > 0 {
 		ur := s.webPageQueue[0]
+		s.webPageQueue[0] = nil // release reference to allow GC
 		s.webPageQueue = s.webPageQueue[1:]
 		currentDepth := s.webPageQueueDepth[ur.String()]
-
-		if s.config.SkipExternalResources && ur.Host != s.URL.Host {
-			s.logger.Debug("Skipping external resource", log.String("url", ur.String()))
-			continue
-		}
 
 		if err := s.processURL(ctx, ur, currentDepth+1); err != nil && errors.Is(err, context.Canceled) {
 			return err
@@ -304,8 +333,10 @@ func (s *Scraper) processURL(ctx context.Context, u *url.URL, currentDepth uint)
 		ur.Fragment = ""
 
 		if s.shouldURLBeDownloaded(ur, currentDepth, false) {
+			s.webPageMu.Lock()
 			s.webPageQueue = append(s.webPageQueue, ur)
 			s.webPageQueueDepth[ur.String()] = currentDepth
+			s.webPageMu.Unlock()
 		}
 	}
 
@@ -397,6 +428,8 @@ func (s *Scraper) incrementProgress() {
 }
 
 // fetchRobotsTxt fetches and parses robots.txt for the main domain.
+// Uses a plain HTTP client without auth credentials to avoid leaking
+// them to the robots.txt endpoint or via redirects.
 func (s *Scraper) fetchRobotsTxt(ctx context.Context) {
 	robotsURL := &url.URL{
 		Scheme: s.URL.Scheme,
@@ -406,13 +439,35 @@ func (s *Scraper) fetchRobotsTxt(ctx context.Context) {
 
 	s.logger.Debug("Fetching robots.txt", log.String("url", robotsURL.String()))
 
-	data, _, err := s.downloadURLWithRetries(ctx, robotsURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, robotsURL.String(), nil)
+	if err != nil {
+		s.logger.Debug("Failed to create robots.txt request", log.Err(err))
+		return
+	}
+	if s.config.UserAgent != "" {
+		req.Header.Set("User-Agent", s.config.UserAgent)
+	}
+
+	// Use a client without auth headers to avoid credential leakage
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
 	if err != nil {
 		s.logger.Debug("Failed to fetch robots.txt, ignoring", log.Err(err))
 		return
 	}
+	defer func() { _ = resp.Body.Close() }()
 
-	robots, err := robotstxt.FromBytes(data)
+	if resp.StatusCode != http.StatusOK {
+		s.logger.Debug("robots.txt returned non-200 status, ignoring")
+		return
+	}
+
+	buf := &bytes.Buffer{}
+	if _, err := buf.ReadFrom(resp.Body); err != nil {
+		s.logger.Debug("Failed to read robots.txt body, ignoring", log.Err(err))
+		return
+	}
+
+	robots, err := robotstxt.FromBytes(buf.Bytes())
 	if err != nil {
 		s.logger.Debug("Failed to parse robots.txt, ignoring", log.Err(err))
 		return

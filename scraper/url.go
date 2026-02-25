@@ -7,7 +7,8 @@ import (
 	"strings"
 )
 
-func resolveURL(base *url.URL, reference, mainPageHost string, isHyperlink bool, relativeToRoot string) string {
+// nolint: cyclop
+func resolveURL(base *url.URL, reference, mainPageHost string, isHyperlink bool, relativeToRoot string, skipExternal bool) string {
 	ur, err := url.Parse(reference)
 	if err != nil {
 		return ""
@@ -15,19 +16,18 @@ func resolveURL(base *url.URL, reference, mainPageHost string, isHyperlink bool,
 
 	var resolvedURL *url.URL
 	if ur.Host != "" && ur.Host != mainPageHost {
-		if isHyperlink { // do not change links to external websites
+		if isHyperlink || skipExternal {
+			// do not change links to external websites or external assets when skipping
 			return reference
 		}
 
 		resolvedURL = base.ResolveReference(ur)
-		resolvedURL.Path = filepath.Join("_"+ur.Host, resolvedURL.Path)
+		resolvedURL.Path = filepath.Join("_"+sanitizeHostForPath(ur.Host), resolvedURL.Path)
 	} else {
 		if isHyperlink {
 			ur.Path = getPageFilePath(ur)
-			resolvedURL = base.ResolveReference(ur)
-		} else {
-			resolvedURL = base.ResolveReference(ur)
 		}
+		resolvedURL = base.ResolveReference(ur)
 	}
 
 	if resolvedURL.Host == mainPageHost {

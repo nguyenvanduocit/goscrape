@@ -8,6 +8,23 @@ import (
 	"strings"
 )
 
+// sanitizeHostForPath strips port and removes any characters that could cause
+// path traversal when a hostname is used as a directory name.
+func sanitizeHostForPath(host string) string {
+	// Strip port
+	if i := strings.LastIndex(host, ":"); i != -1 {
+		host = host[:i]
+	}
+	// Remove path separators and traversal characters
+	host = strings.ReplaceAll(host, "..", "")
+	host = strings.ReplaceAll(host, "/", "")
+	host = strings.ReplaceAll(host, "\\", "")
+	if host == "" {
+		host = "unknown"
+	}
+	return host
+}
+
 const (
 	// PageExtension is the file extension that downloaded pages get.
 	PageExtension = ".html"
@@ -32,7 +49,7 @@ func (s *Scraper) getFilePath(url *url.URL, isAPage bool) string {
 
 	var externalHost string
 	if url.Host != s.URL.Host {
-		externalHost = "_" + url.Host // _ is a prefix for external domains on the filesystem
+		externalHost = "_" + sanitizeHostForPath(url.Host) // _ is a prefix for external domains on the filesystem
 	}
 
 	// Split the file path into directory and filename components
@@ -49,7 +66,23 @@ func (s *Scraper) getFilePath(url *url.URL, isAPage bool) string {
 		fileName = filepath.Join(dir, truncatedBase)
 	}
 
-	return filepath.Join(s.config.OutputDirectory, s.URL.Host, externalHost, fileName)
+	result := filepath.Join(s.config.OutputDirectory, s.URL.Host, externalHost, fileName)
+
+	// Guard against path traversal: ensure final path stays under the output root
+	outputRoot := filepath.Join(s.config.OutputDirectory, s.URL.Host)
+	absResult, err := filepath.Abs(result)
+	if err != nil {
+		return filepath.Join(outputRoot, "invalid_path")
+	}
+	absRoot, err := filepath.Abs(outputRoot)
+	if err != nil {
+		return filepath.Join(outputRoot, "invalid_path")
+	}
+	if !strings.HasPrefix(absResult, absRoot+string(filepath.Separator)) && absResult != absRoot {
+		return filepath.Join(outputRoot, "invalid_path")
+	}
+
+	return result
 }
 
 // getPageFilePath returns a filename for a URL that represents a web page.

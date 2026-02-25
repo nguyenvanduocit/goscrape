@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"mime"
 	"net/http"
+	"time"
 
 	"github.com/cornelk/gotokit/log"
 )
@@ -12,7 +13,8 @@ import (
 // set more mime types in the browser, this for example fixes .asp files not being
 // downloaded but handled as html.
 var mimeTypes = map[string]string{
-	".asp": "text/html; charset=utf-8",
+	".asp":  "text/html; charset=utf-8",
+	".wasm": "application/wasm",
 }
 
 // ServeDirectory serves a directory on a given port as a web server.
@@ -34,8 +36,9 @@ func ServeDirectory(ctx context.Context, path string, port int16, logger *log.Lo
 		log.String("address", fullAddr))
 
 	server := &http.Server{
-		Addr:    fmt.Sprintf(":%d", port),
-		Handler: mux,
+		Addr:              fmt.Sprintf("127.0.0.1:%d", port),
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	serverErr := make(chan error, 1)
