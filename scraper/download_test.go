@@ -30,17 +30,17 @@ func TestCSSProcessor(t *testing.T) {
 
 	u, _ := url.Parse("http://localhost")
 	for input, expected := range fixtures {
-		s.imagesQueue = nil
+		s.assetQueue = nil
 		s.cssProcessor(u, []byte(input))
 
 		if expected == "" {
-			assert.Empty(t, s.imagesQueue)
+			assert.Empty(t, s.assetQueue)
 			continue
 		}
 
-		assert.NotEmpty(t, s.imagesQueue)
+		assert.NotEmpty(t, s.assetQueue)
 
-		res := s.imagesQueue[0].String()
+		res := s.assetQueue[0].String()
 		assert.Equal(t, expected, res)
 	}
 }

@@ -39,12 +39,13 @@ func (s *Scraper) shouldURLBeDownloaded(url *url.URL, currentDepth uint, isAsset
 	// Normalize the path for duplicate detection to handle trailing slashes
 	normalizedPath := normalizeURLPath(p)
 
-	// Thread-safe check if already seen
+	// Atomically check-and-mark to prevent duplicate downloads
 	s.processedMu.Lock()
 	if s.processed.Contains(normalizedPath) {
 		s.processedMu.Unlock()
 		return false
 	}
+	s.processed.Add(normalizedPath)
 	s.processedMu.Unlock()
 
 	if url.Host != s.URL.Host {
@@ -84,17 +85,6 @@ func (s *Scraper) shouldURLBeDownloaded(url *url.URL, currentDepth uint, isAsset
 			return false
 		}
 	}
-
-	// All checks passed — mark as processed (benign race: two goroutines may both
-	// pass the initial Contains check for the same URL, but fileExists guards
-	// against duplicate writes in downloadAsset)
-	s.processedMu.Lock()
-	if s.processed.Contains(normalizedPath) {
-		s.processedMu.Unlock()
-		return false
-	}
-	s.processed.Add(normalizedPath)
-	s.processedMu.Unlock()
 
 	s.logger.Debug("New URL to download", log.String("url", url.String()))
 	return true

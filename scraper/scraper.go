@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
@@ -68,6 +69,37 @@ type (
 	fileWriter         func(filePath string, data []byte) error
 )
 
+// blockedIPRanges contains IP ranges that should be blocked for SSRF protection
+// beyond what Go's IsLoopback/IsPrivate/IsLinkLocal covers.
+var blockedIPRanges []*net.IPNet
+
+func init() {
+	for _, cidr := range []string{
+		"100.64.0.0/10",      // CGNAT / RFC 6598
+		"0.0.0.0/8",          // This network / RFC 1122
+		"192.0.2.0/24",       // TEST-NET-1 / RFC 5737
+		"198.51.100.0/24",    // TEST-NET-2 / RFC 5737
+		"203.0.113.0/24",     // TEST-NET-3 / RFC 5737
+		"240.0.0.0/4",        // Reserved / RFC 1112
+		"255.255.255.255/32", // Broadcast
+	} {
+		_, n, _ := net.ParseCIDR(cidr)
+		blockedIPRanges = append(blockedIPRanges, n)
+	}
+}
+
+func isBlockedIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return true
+	}
+	for _, cidr := range blockedIPRanges {
+		if cidr.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 // FailedURL represents a URL that failed to download.
 type FailedURL struct {
 	URL       string
@@ -92,8 +124,8 @@ type Scraper struct {
 	processed   set.Set[string]
 	processedMu sync.Mutex // protects processed set during concurrent access
 
-	imagesQueue       []*url.URL
-	assetsMu          sync.Mutex // protects imagesQueue during concurrent access
+	assetQueue       []*url.URL
+	assetsMu          sync.Mutex // protects assetQueue during concurrent access
 	webPageQueue      []*url.URL
 	webPageQueueDepth map[string]uint
 	webPageMu         sync.Mutex // protects webPageQueue and webPageQueueDepth
@@ -125,7 +157,7 @@ func New(logger *log.Logger, cfg Config) (*Scraper, error) {
 
 	u, err := url.Parse(cfg.URL)
 	if err != nil {
-		errs = append(errs, err)
+		return nil, fmt.Errorf("parsing URL: %w", err)
 	}
 	u.Fragment = ""
 
@@ -175,16 +207,20 @@ func New(logger *log.Logger, cfg Config) (*Scraper, error) {
 		if err != nil {
 			return nil, fmt.Errorf("resolving host: %w", err)
 		}
+		if len(ips) == 0 {
+			return nil, fmt.Errorf("no addresses resolved for host: %s", host)
+		}
 		for _, ipStr := range ips {
 			ip := net.ParseIP(ipStr)
 			if ip == nil {
 				continue
 			}
-			if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			if isBlockedIP(ip) {
 				return nil, fmt.Errorf("blocked request to private/internal address: %s (%s)", host, ipStr)
 			}
 		}
-		return originalDialer.DialContext(ctx, network, net.JoinHostPort(host, port))
+		// Dial the verified IP directly to prevent DNS rebinding attacks
+		return originalDialer.DialContext(ctx, network, net.JoinHostPort(ips[0], port))
 	}
 
 	client := &http.Client{
@@ -220,7 +256,11 @@ func New(logger *log.Logger, cfg Config) (*Scraper, error) {
 
 	// Initialize rate limiter if configured
 	if cfg.RateLimit > 0 {
-		s.rateLimiter = rate.NewLimiter(rate.Limit(cfg.RateLimit), 1)
+		burst := cfg.Concurrency
+		if burst < 1 {
+			burst = 1
+		}
+		s.rateLimiter = rate.NewLimiter(rate.Limit(cfg.RateLimit), burst)
 	}
 
 	// Set default concurrency
@@ -261,11 +301,20 @@ func (s *Scraper) Start(ctx context.Context) error {
 		return err
 	}
 
-	for len(s.webPageQueue) > 0 {
-		ur := s.webPageQueue[0]
-		s.webPageQueue[0] = nil // release reference to allow GC
-		s.webPageQueue = s.webPageQueue[1:]
-		currentDepth := s.webPageQueueDepth[ur.String()]
+	head := 0
+	for {
+		s.webPageMu.Lock()
+		if head >= len(s.webPageQueue) {
+			s.webPageMu.Unlock()
+			break
+		}
+		ur := s.webPageQueue[head]
+		s.webPageQueue[head] = nil // release reference to allow GC
+		urlStr := ur.String()
+		currentDepth := s.webPageQueueDepth[urlStr]
+		delete(s.webPageQueueDepth, urlStr)
+		head++
+		s.webPageMu.Unlock()
 
 		if err := s.processURL(ctx, ur, currentDepth+1); err != nil && errors.Is(err, context.Canceled) {
 			return err
@@ -353,24 +402,22 @@ func (s *Scraper) storeDownload(u *url.URL, data []byte, doc *html.Node,
 	// - HTML pages: add .html extension, handle directory indexes like /about -> /about.html
 	// - Binary files: keep original path, so /photo.jpg stays /photo.jpg, not /photo.jpg.html
 	// This prevents breaking binary downloads that were working before.
-	isAPage := false
+	isHTML := false
 	if fileExtension == "" {
 		fixed, hasChanges, err := s.fixURLReferences(u, doc, index)
 		if err != nil {
 			s.logger.Error("Fixing file references failed",
 				log.String("url", u.String()),
 				log.Err(err))
-			return
-		}
-
-		if hasChanges {
+			// Write raw data as fallback instead of skipping the page entirely
+		} else if hasChanges {
 			data = fixed
 		}
 		// Only HTML content gets processed as a "page" - binary files stay as-is
-		isAPage = true
+		isHTML = true
 	}
 
-	filePath := s.getFilePath(u, isAPage)
+	filePath := s.getFilePath(u, isHTML)
 	// always update html files, content might have changed
 	if err := s.fileWriter(filePath, data); err != nil {
 		s.logger.Error("Writing to file failed",
@@ -461,8 +508,9 @@ func (s *Scraper) fetchRobotsTxt(ctx context.Context) {
 		return
 	}
 
+	const maxRobotsTxtSize int64 = 512 * 1024
 	buf := &bytes.Buffer{}
-	if _, err := buf.ReadFrom(resp.Body); err != nil {
+	if _, err := buf.ReadFrom(io.LimitReader(resp.Body, maxRobotsTxtSize)); err != nil {
 		s.logger.Debug("Failed to read robots.txt body, ignoring", log.Err(err))
 		return
 	}

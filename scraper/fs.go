@@ -15,7 +15,7 @@ func (s *Scraper) createDownloadPath(path string) error {
 	}
 
 	s.logger.Debug("Creating dir", log.String("path", path))
-	if err := os.MkdirAll(path, os.ModePerm); err != nil {
+	if err := os.MkdirAll(path, 0755); err != nil {
 		return fmt.Errorf("creating directory '%s': %w", path, err)
 	}
 	return nil
@@ -51,8 +51,6 @@ func (s *Scraper) writeFile(filePath string, data []byte) error {
 }
 
 func (s *Scraper) fileExists(filePath string) bool {
-	if _, err := os.Stat(filePath); !os.IsNotExist(err) {
-		return true
-	}
-	return false
+	_, err := os.Stat(filePath)
+	return err == nil
 }

@@ -15,10 +15,18 @@ func sanitizeHostForPath(host string) string {
 	if i := strings.LastIndex(host, ":"); i != -1 {
 		host = host[:i]
 	}
-	// Remove path separators and traversal characters
+	// Strip brackets from IPv6 addresses
+	host = strings.Trim(host, "[]")
+	// Allowlist: only permit valid hostname characters
+	var b strings.Builder
+	for _, r := range host {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '-' || r == '.' {
+			b.WriteRune(r)
+		}
+	}
+	host = b.String()
 	host = strings.ReplaceAll(host, "..", "")
-	host = strings.ReplaceAll(host, "/", "")
-	host = strings.ReplaceAll(host, "\\", "")
 	if host == "" {
 		host = "unknown"
 	}
@@ -35,13 +43,13 @@ const (
 )
 
 // getFilePath returns a file path for a URL to store the URL content in.
-// The isAPage parameter is crucial: it tells us whether this URL contains HTML content
+// The isHTML parameter is crucial: it tells us whether this URL contains HTML content
 // that should be treated as a web page (with .html extensions and directory indexing)
 // or if it's a binary file that should keep its original path unchanged.
 // Without this distinction, binary files would get corrupted paths like image.jpg.html.
-func (s *Scraper) getFilePath(url *url.URL, isAPage bool) string {
+func (s *Scraper) getFilePath(url *url.URL, isHTML bool) string {
 	fileName := url.Path
-	if isAPage {
+	if isHTML {
 		// This is HTML content - apply web page naming conventions
 		fileName = getPageFilePath(url)
 	}

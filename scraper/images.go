@@ -86,8 +86,12 @@ func (s *Scraper) recodePNG(url fmt.Stringer, data []byte) []byte {
 		return nil
 	}
 
-	encoded := s.encodeJPEG(img)
-	if encoded == nil || len(encoded) > len(data) { // only use the new file if it is smaller
+	outBuf := &bytes.Buffer{}
+	if err := png.Encode(outBuf, img); err != nil {
+		return nil
+	}
+	encoded := outBuf.Bytes()
+	if len(encoded) >= len(data) {
 		return nil
 	}
 

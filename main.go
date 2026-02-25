@@ -136,7 +136,7 @@ func runScraper(ctx context.Context, args arguments, logger *log.Logger) error {
 
 	var username, password string
 	if args.User != "" {
-		sl := strings.Split(args.User, ":")
+		sl := strings.SplitN(args.User, ":", 2)
 		username = sl[0]
 		if len(sl) > 1 {
 			password = sl[1]
@@ -144,7 +144,7 @@ func runScraper(ctx context.Context, args arguments, logger *log.Logger) error {
 	}
 
 	imageQuality := args.ImageQuality
-	if args.ImageQuality < 0 || args.ImageQuality >= 100 {
+	if args.ImageQuality < 0 || args.ImageQuality > 100 {
 		imageQuality = 0
 	}
 
@@ -273,7 +273,7 @@ func saveCookies(cookieFile string, cookies []scraper.Cookie) error {
 		return fmt.Errorf("marshaling cookies: %w", err)
 	}
 
-	if err := os.WriteFile(cookieFile, b, 0644); err != nil {
+	if err := os.WriteFile(cookieFile, b, 0600); err != nil {
 		return fmt.Errorf("saving cookies: %w", err)
 	}
 

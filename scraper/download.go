@@ -28,7 +28,6 @@ type downloadTask struct {
 var tagsWithReferences = []string{
 	htmlindex.LinkTag,
 	htmlindex.ScriptTag,
-	htmlindex.BodyTag,
 	htmlindex.StyleTag,
 	htmlindex.InlineStyleTag,
 }
@@ -40,7 +39,7 @@ func (s *Scraper) downloadReferences(ctx context.Context, index *htmlindex.Index
 		s.logger.Error("Getting body node URLs failed", log.Err(err))
 	}
 	s.assetsMu.Lock()
-	s.imagesQueue = append(s.imagesQueue, references...)
+	s.assetQueue = append(s.assetQueue, references...)
 	s.assetsMu.Unlock()
 
 	// Collect img tags
@@ -49,7 +48,7 @@ func (s *Scraper) downloadReferences(ctx context.Context, index *htmlindex.Index
 		s.logger.Error("Getting img node URLs failed", log.Err(err))
 	}
 	s.assetsMu.Lock()
-	s.imagesQueue = append(s.imagesQueue, references...)
+	s.assetQueue = append(s.assetQueue, references...)
 	s.assetsMu.Unlock()
 
 	// Collect all tasks
@@ -77,8 +76,8 @@ func (s *Scraper) downloadReferences(ctx context.Context, index *htmlindex.Index
 
 	// Add image tasks (snapshot under lock to avoid race with concurrent processors)
 	s.assetsMu.Lock()
-	pending := s.imagesQueue
-	s.imagesQueue = nil
+	pending := s.assetQueue
+	s.assetQueue = nil
 	s.assetsMu.Unlock()
 
 	for _, image := range pending {
@@ -98,12 +97,12 @@ func (s *Scraper) downloadReferences(ctx context.Context, index *htmlindex.Index
 func (s *Scraper) processDiscoveredAssets(ctx context.Context) error {
 	for {
 		s.assetsMu.Lock()
-		if len(s.imagesQueue) == 0 {
+		if len(s.assetQueue) == 0 {
 			s.assetsMu.Unlock()
 			return nil
 		}
-		pending := s.imagesQueue
-		s.imagesQueue = nil
+		pending := s.assetQueue
+		s.assetQueue = nil
 		s.assetsMu.Unlock()
 
 		var tasks []downloadTask
@@ -242,7 +241,7 @@ func (s *Scraper) cssProcessor(baseURL *url.URL, data []byte) []byte {
 		}
 		// Count directory levels to go up: 1 for the file's directory + 1 for the _hostname directory
 		pathDir := path.Dir(cssPath)
-		levelsUp := 2
+		levelsUp := 1
 		if pathDir != "/" && pathDir != "." {
 			levelsUp += strings.Count(pathDir, "/")
 		}
@@ -277,12 +276,15 @@ func (s *Scraper) cssProcessor(baseURL *url.URL, data []byte) []byte {
 		return data
 	}
 
+	var cssReplacerPairs []string
 	for ori, fixed := range urls {
-		// Direct replacement: token.Value -> url('new_path')
-		cssData = strings.ReplaceAll(cssData, ori, fixed)
+		cssReplacerPairs = append(cssReplacerPairs, ori, fixed)
 		s.logger.Debug("CSS Element relinked",
 			log.String("url", ori),
 			log.String("fixed_url", fixed))
+	}
+	if len(cssReplacerPairs) > 0 {
+		cssData = strings.NewReplacer(cssReplacerPairs...).Replace(cssData)
 	}
 
 	return []byte(cssData)
@@ -403,7 +405,7 @@ func (s *Scraper) jsProcessor(baseURL *url.URL, data []byte) []byte {
 				continue
 			}
 			src := match[1]
-			if strings.HasPrefix(src, "data:") || strings.Contains(src, "..") || urls[src] != "" {
+			if strings.HasPrefix(src, "data:") || urls[src] != "" {
 				continue
 			}
 			u, err := baseURL.Parse(src)
@@ -421,11 +423,15 @@ func (s *Scraper) jsProcessor(baseURL *url.URL, data []byte) []byte {
 
 	s.enqueueAssets(discovered)
 
+	var jsReplacerPairs []string
 	for ori, filePath := range urls {
 		if ori != filePath {
-			jsData = strings.ReplaceAll(jsData, ori, filePath)
+			jsReplacerPairs = append(jsReplacerPairs, ori, filePath)
 			s.logger.Debug("JS URL relinked", log.String("url", ori), log.String("fixed_url", filePath))
 		}
+	}
+	if len(jsReplacerPairs) > 0 {
+		jsData = strings.NewReplacer(jsReplacerPairs...).Replace(jsData)
 	}
 
 	if !skipExternal {
@@ -441,6 +447,6 @@ func (s *Scraper) enqueueAssets(urls []*url.URL) {
 		return
 	}
 	s.assetsMu.Lock()
-	s.imagesQueue = append(s.imagesQueue, urls...)
+	s.assetQueue = append(s.assetQueue, urls...)
 	s.assetsMu.Unlock()
 }

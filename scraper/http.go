@@ -29,6 +29,9 @@ var (
 		http.StatusServiceUnavailable:  true, // 503
 		http.StatusGatewayTimeout:      true, // 504
 	}
+
+	// maxResponseBodySize is the maximum response body size (bytes) to read into memory.
+	maxResponseBodySize int64 = 100 * 1024 * 1024
 )
 
 func (s *Scraper) downloadURL(ctx context.Context, u *url.URL) (*http.Response, error) {
@@ -71,33 +74,34 @@ func (s *Scraper) downloadURLWithRetries(ctx context.Context, u *url.URL) ([]byt
 		}
 	}
 
-	var err error
 	var resp *http.Response
 
-	for retries := range maxRetries + 2 {
-		if retries == maxRetries+1 {
-			return nil, nil, fmt.Errorf("%w for URL %s", errExhaustedRetries, u)
-		}
-
+	for attempt := range maxRetries + 1 {
+		var err error
 		resp, err = s.downloadURL(ctx, u)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		if retryableStatusCodes[resp.StatusCode] {
-			s.logger.Warn("Retryable HTTP status. Retrying",
-				log.Int("status", resp.StatusCode),
-				log.Int("retry", retries+1),
-				log.Int("max", maxRetries),
-				log.String("url", u.String()))
-
-			// Wait a bit and try again using exponential backoff on each retry
-			if err := app.Sleep(ctx, (time.Duration(retries)+1)*retryDelay); err != nil {
-				return nil, nil, fmt.Errorf("sleeping between retries: %w", err)
-			}
-			continue
+		if !retryableStatusCodes[resp.StatusCode] {
+			break
 		}
-		break
+
+		_ = resp.Body.Close()
+
+		if attempt == maxRetries {
+			return nil, nil, fmt.Errorf("%w for URL %s", errExhaustedRetries, u)
+		}
+
+		s.logger.Warn("Retryable HTTP status. Retrying",
+			log.Int("status", resp.StatusCode),
+			log.Int("attempt", attempt+1),
+			log.Int("max", maxRetries),
+			log.String("url", u.String()))
+
+		if err := app.Sleep(ctx, time.Duration(attempt+1)*retryDelay); err != nil {
+			return nil, nil, fmt.Errorf("sleeping between retries: %w", err)
+		}
 	}
 
 	defer func() {
@@ -113,7 +117,7 @@ func (s *Scraper) downloadURLWithRetries(ctx context.Context, u *url.URL) ([]byt
 	}
 
 	buf := &bytes.Buffer{}
-	if _, err := io.Copy(buf, resp.Body); err != nil {
+	if _, err := io.Copy(buf, io.LimitReader(resp.Body, maxResponseBodySize)); err != nil {
 		return nil, nil, fmt.Errorf("reading HTTP request body: %w", err)
 	}
 	return buf.Bytes(), resp.Request.URL, nil
