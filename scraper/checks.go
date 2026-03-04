@@ -54,7 +54,8 @@ func (s *Scraper) shouldURLBeDownloaded(url *url.URL, currentDepth uint, isAsset
 			return false
 		}
 		// Skip external assets by default, only download if --include-external is passed
-		if s.config.SkipExternalResources {
+		// or if the host is in the allowed CDN list
+		if s.config.SkipExternalResources && !s.allowedCDN.Contains(url.Host) {
 			s.logger.Debug("Skipping external asset", log.String("url", url.String()))
 			return false
 		}

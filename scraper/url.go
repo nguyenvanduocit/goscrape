@@ -5,10 +5,12 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+
+	"github.com/cornelk/gotokit/set"
 )
 
 // nolint: cyclop
-func resolveURL(base *url.URL, reference, mainPageHost string, isHyperlink bool, relativeToRoot string, skipExternal bool) string {
+func resolveURL(base *url.URL, reference, mainPageHost string, isHyperlink bool, relativeToRoot string, skipExternal bool, allowedCDN set.Set[string]) string {
 	ur, err := url.Parse(reference)
 	if err != nil {
 		return ""
@@ -16,7 +18,10 @@ func resolveURL(base *url.URL, reference, mainPageHost string, isHyperlink bool,
 
 	var resolvedURL *url.URL
 	if ur.Host != "" && ur.Host != mainPageHost {
-		if isHyperlink || skipExternal {
+		// Check if this external host is in the allowed CDN list
+		isAllowedCDN := allowedCDN != nil && allowedCDN.Contains(ur.Host)
+
+		if isHyperlink || (skipExternal && !isAllowedCDN) {
 			// do not change links to external websites or external assets when skipping
 			return reference
 		}

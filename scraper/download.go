@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"path"
 	"regexp"
@@ -13,6 +14,7 @@ import (
 	"github.com/cornelk/goscrape/css"
 	"github.com/cornelk/goscrape/htmlindex"
 	"github.com/cornelk/gotokit/log"
+	"github.com/cornelk/gotokit/set"
 )
 
 // assetProcessor is a processor of a downloaded asset that can transform
@@ -204,6 +206,11 @@ func (s *Scraper) downloadAsset(ctx context.Context, u *url.URL, processor asset
 	s.logger.Info("Downloading asset", log.String("url", urlFull))
 	data, _, err := s.httpDownloader(ctx, u)
 	if err != nil {
+		// Skip silently if configured and error is 403 Forbidden
+		if s.config.Skip403 && IsHTTPStatusError(err, http.StatusForbidden) {
+			s.incrementProgress()
+			return nil
+		}
 		s.logger.Error("Downloading asset failed",
 			log.String("url", urlFull),
 			log.Err(err))
@@ -256,7 +263,7 @@ func (s *Scraper) cssProcessor(baseURL *url.URL, data []byte) []byte {
 		discovered = append(discovered, u)
 
 		// Resolve URL relative to CSS file location (baseURL)
-		resolved := resolveURL(baseURL, urlStr, s.URL.Host, false, "", s.config.SkipExternalResources)
+		resolved := resolveURL(baseURL, urlStr, s.URL.Host, false, "", s.config.SkipExternalResources, s.allowedCDN)
 
 		// For external CSS files, prepend relative path to root
 		if baseURL.Host != s.URL.Host && !strings.HasPrefix(resolved, "../") {
@@ -306,7 +313,7 @@ var (
 // findDirFileCombinations finds likely asset paths by combining directory paths and filenames
 // found in JS code. Uses O(D+F) map lookup instead of O(D*F) nested loop.
 func findDirFileCombinations(jsData string, baseURL *url.URL, mainHost string,
-	urls map[string]string, skipExternal bool) []*url.URL {
+	urls map[string]string, skipExternal bool, allowedCDN set.Set[string]) []*url.URL {
 
 	dirPaths := jsDirPathPattern.FindAllStringSubmatch(jsData, -1)
 	fileNames := jsFileNamePattern.FindAllStringSubmatch(jsData, -1)
@@ -353,7 +360,7 @@ func findDirFileCombinations(jsData string, baseURL *url.URL, mainHost string,
 				continue
 			}
 			discovered = append(discovered, u)
-			resolved := resolveURL(baseURL, fullPath, mainHost, false, "", skipExternal)
+			resolved := resolveURL(baseURL, fullPath, mainHost, false, "", skipExternal, allowedCDN)
 			urls[`"`+fullPath+`"`] = `"` + resolved + `"`
 			urls[`'`+fullPath+`'`] = `'` + resolved + `'`
 		}
@@ -397,7 +404,7 @@ func (s *Scraper) jsProcessor(baseURL *url.URL, data []byte) []byte {
 		jsExternalPathPattern,
 	}
 
-	discovered = append(discovered, findDirFileCombinations(jsData, baseURL, s.URL.Host, urls, skipExternal)...)
+	discovered = append(discovered, findDirFileCombinations(jsData, baseURL, s.URL.Host, urls, skipExternal, s.allowedCDN)...)
 
 	for _, pattern := range patterns {
 		for _, match := range pattern.FindAllStringSubmatch(jsData, -1) {
@@ -417,7 +424,7 @@ func (s *Scraper) jsProcessor(baseURL *url.URL, data []byte) []byte {
 				continue
 			}
 			discovered = append(discovered, u)
-			urls[src] = resolveURL(baseURL, src, s.URL.Host, false, "", skipExternal)
+			urls[src] = resolveURL(baseURL, src, s.URL.Host, false, "", skipExternal, s.allowedCDN)
 		}
 	}
 

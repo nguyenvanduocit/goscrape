@@ -49,6 +49,10 @@ type Config struct {
 
 	SkipExternalResources bool // skip external resources, only scrape URLs from the same domain
 
+	// AllowCDN specifies external domains allowed for asset downloads.
+	// Only used when SkipExternalResources is true.
+	AllowCDN []string
+
 	// Concurrency and rate limiting
 	Concurrency int     // number of concurrent asset downloads
 	RateLimit   float64 // max requests per second, 0 for unlimited
@@ -60,6 +64,9 @@ type Config struct {
 
 	// robots.txt
 	RespectRobots bool // respect robots.txt rules
+
+	// Skip403 silently skips URLs that return 403 Forbidden instead of logging errors
+	Skip403 bool
 }
 
 type (
@@ -148,6 +155,9 @@ type Scraper struct {
 
 	// robots.txt
 	robotsData *robotstxt.RobotsData
+
+	// allowedCDN contains external domains allowed for asset downloads
+	allowedCDN set.Set[string]
 }
 
 // New creates a new Scraper instance.
@@ -243,6 +253,7 @@ func New(logger *log.Logger, cfg Config) (*Scraper, error) {
 		processed: set.New[string](),
 
 		webPageQueueDepth: map[string]uint{},
+		allowedCDN:        set.NewFromSlice(cfg.AllowCDN),
 	}
 
 	s.dirCreator = s.createDownloadPath

@@ -23,6 +23,7 @@ var (
 
 	// retryableStatusCodes are HTTP status codes that should trigger a retry.
 	retryableStatusCodes = map[int]bool{
+		http.StatusForbidden:           true, // 403
 		http.StatusTooManyRequests:     true, // 429
 		http.StatusInternalServerError: true, // 500
 		http.StatusBadGateway:          true, // 502
@@ -33,6 +34,25 @@ var (
 	// maxResponseBodySize is the maximum response body size (bytes) to read into memory.
 	maxResponseBodySize int64 = 100 * 1024 * 1024
 )
+
+// HTTPStatusError is returned when an HTTP request returns a non-200 status code.
+type HTTPStatusError struct {
+	StatusCode int
+	URL        string
+}
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("unexpected HTTP request status code %d", e.StatusCode)
+}
+
+// IsHTTPStatusError checks if an error is an HTTPStatusError with a specific status code.
+func IsHTTPStatusError(err error, statusCode int) bool {
+	var httpErr *HTTPStatusError
+	if errors.As(err, &httpErr) {
+		return httpErr.StatusCode == statusCode
+	}
+	return false
+}
 
 func (s *Scraper) downloadURL(ctx context.Context, u *url.URL) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
@@ -113,7 +133,7 @@ func (s *Scraper) downloadURLWithRetries(ctx context.Context, u *url.URL) ([]byt
 	}()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, nil, fmt.Errorf("unexpected HTTP request status code %d", resp.StatusCode)
+		return nil, nil, &HTTPStatusError{StatusCode: resp.StatusCode, URL: u.String()}
 	}
 
 	buf := &bytes.Buffer{}

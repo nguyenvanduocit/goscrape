@@ -37,7 +37,7 @@ func TestResolveURL(t *testing.T) {
 	}
 
 	for _, fix := range fixtures {
-		resolved := resolveURL(&fix.BaseURL, fix.Reference, URL.Host, fix.IsHyperlink, fix.RelativeToRoot, false)
+		resolved := resolveURL(&fix.BaseURL, fix.Reference, URL.Host, fix.IsHyperlink, fix.RelativeToRoot, false, nil)
 		assert.Equal(t, fix.Resolved, resolved)
 	}
 }

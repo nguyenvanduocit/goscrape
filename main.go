@@ -24,8 +24,8 @@ var (
 )
 
 type arguments struct {
-	Include []string `arg:"-n,--include" help:"only include URLs with PERL Regular Expressions support"`
-	Exclude []string `arg:"-x,--exclude" help:"exclude URLs with PERL Regular Expressions support"`
+	Include []string `arg:"-n,--include,separate" help:"only include URLs with PERL Regular Expressions support"`
+	Exclude []string `arg:"-x,--exclude,separate" help:"exclude URLs with PERL Regular Expressions support"`
 	Output  string   `arg:"-o,--output" help:"output directory to write files to"`
 	URLs    []string `arg:"positional"`
 
@@ -46,7 +46,8 @@ type arguments struct {
 
 	Verbose bool `arg:"-v,--verbose" help:"verbose output"`
 
-	IncludeExternal bool `arg:"-e,--include-external" help:"include external resources from other domains"`
+	IncludeExternal bool     `arg:"-e,--include-external" help:"include external resources from other domains"`
+	AllowCDN        []string `arg:"--allow-cdn" help:"allow external assets from specific CDN domains (e.g., cdn.example.com)"`
 
 	// Concurrency and rate limiting
 	Concurrency int     `arg:"-j,--concurrency" help:"number of concurrent asset downloads" default:"4"`
@@ -59,6 +60,9 @@ type arguments struct {
 
 	// robots.txt
 	RespectRobots bool `arg:"--respect-robots" help:"respect robots.txt rules"`
+
+	// Skip 403
+	Skip403 bool `arg:"--skip-403" help:"silently skip URLs that return 403 Forbidden instead of logging errors"`
 }
 
 func (arguments) Description() string {
@@ -171,6 +175,7 @@ func runScraper(ctx context.Context, args arguments, logger *log.Logger) error {
 		UserAgent: args.UserAgent,
 
 		SkipExternalResources: !args.IncludeExternal,
+		AllowCDN:              args.AllowCDN,
 
 		// Concurrency and rate limiting
 		Concurrency: args.Concurrency,
@@ -183,6 +188,9 @@ func runScraper(ctx context.Context, args arguments, logger *log.Logger) error {
 
 		// robots.txt
 		RespectRobots: args.RespectRobots,
+
+		// Skip 403
+		Skip403: args.Skip403,
 	}
 
 	return scrapeURLs(ctx, cfg, logger, args)
