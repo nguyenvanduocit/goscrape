@@ -38,9 +38,19 @@ const (
 	PageExtension = ".html"
 	// PageDirIndex is the file name of the index file for every dir.
 	PageDirIndex = "index" + PageExtension
+	// MarkdownExtension is the file extension for markdown output.
+	MarkdownExtension = ".md"
 	// MaxFilenameLength is the maximum length for a filename component to ensure filesystem compatibility.
 	MaxFilenameLength = 200
 )
+
+// pageExtension returns the file extension for HTML pages based on config.
+func (s *Scraper) pageExtension() string {
+	if s.config.Markdown {
+		return MarkdownExtension
+	}
+	return PageExtension
+}
 
 // getFilePath returns a file path for a URL to store the URL content in.
 // The isHTML parameter is crucial: it tells us whether this URL contains HTML content
@@ -49,9 +59,17 @@ const (
 // Without this distinction, binary files would get corrupted paths like image.jpg.html.
 func (s *Scraper) getFilePath(url *url.URL, isHTML bool) string {
 	fileName := url.Path
+	// Handle CDN concatenation URLs (e.g., /path/??file1.js,file2.js)
+	// where ?? is parsed as query string, leaving path as a directory.
+	if strings.HasPrefix(url.RawQuery, "?") {
+		query := strings.TrimPrefix(url.RawQuery, "?")
+		if files := strings.SplitN(query, ",", 2); len(files) > 0 && files[0] != "" {
+			fileName = filepath.Join(fileName, files[0])
+		}
+	}
 	if isHTML {
 		// This is HTML content - apply web page naming conventions
-		fileName = getPageFilePath(url)
+		fileName = getPageFilePathWithExt(url, s.pageExtension())
 	}
 	// If not a page, keep the original URL path for binary files
 
@@ -93,26 +111,32 @@ func (s *Scraper) getFilePath(url *url.URL, isHTML bool) string {
 	return result
 }
 
-// getPageFilePath returns a filename for a URL that represents a web page.
-// This function adds .html extensions and handles directory indexing,
-// which is what we want for HTML content but NOT for binary files like images or PDFs.
-func getPageFilePath(url *url.URL) string {
+// getPageFilePathWithExt returns a filename for a URL that represents a web page,
+// using the specified file extension for pages without an existing extension.
+// When pageExt is the markdown extension, any existing dynamic-page extension
+// (.php, .aspx, .html, etc.) is replaced because the content stored on disk is
+// markdown, not the original page type.
+func getPageFilePathWithExt(url *url.URL, pageExt string) string {
 	fileName := url.Path
+	dirIndex := "index" + pageExt
 
-	// root of domain will be index.html
+	// root of domain will be index file
 	switch {
 	case fileName == "" || fileName == "/":
-		fileName = PageDirIndex
-		// directory index will be index.html in the directory
+		fileName = dirIndex
 
 	case fileName[len(fileName)-1] == '/':
-		fileName += PageDirIndex
+		fileName += dirIndex
 
 	default:
 		ext := filepath.Ext(fileName)
-		// if file extension is missing add .html, otherwise keep the existing file extension
-		if ext == "" {
-			fileName += PageExtension
+		switch {
+		case ext == "":
+			fileName += pageExt
+		case pageExt == MarkdownExtension:
+			// Content has been converted to markdown — the file extension must
+			// reflect the actual content type, not the URL's dynamic-page suffix.
+			fileName = strings.TrimSuffix(fileName, ext) + pageExt
 		}
 	}
 

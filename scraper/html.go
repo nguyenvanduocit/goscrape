@@ -109,9 +109,9 @@ func (s *Scraper) fixNodeURL(baseURL *url.URL, attributes []string, node *html.N
 		var adjusted string
 
 		if htmlindex.SrcSetAttributes.Contains(attr.Key) {
-			adjusted = resolveSrcSetURLs(baseURL, value, s.URL.Host, isHyperlink, relativeToRoot, s.config.SkipExternalResources, s.allowedCDN)
+			adjusted = resolveSrcSetURLs(baseURL, value, s.URL.Host, isHyperlink, relativeToRoot, s.config.SkipExternalResources, s.allowedCDN, s.pageExtension())
 		} else {
-			adjusted = resolveURL(baseURL, value, s.URL.Host, isHyperlink, relativeToRoot, s.config.SkipExternalResources, s.allowedCDN)
+			adjusted = resolveURL(baseURL, value, s.URL.Host, isHyperlink, relativeToRoot, s.config.SkipExternalResources, s.allowedCDN, s.pageExtension())
 		}
 
 		if adjusted == value { // check for no change
@@ -146,7 +146,7 @@ func (s *Scraper) fixStyleTagURL(baseURL *url.URL, node *html.Node,
 		if s.config.SkipExternalResources && u != nil && u.Host != "" && u.Host != s.URL.Host {
 			return
 		}
-		adjusted := resolveURL(baseURL, before, s.URL.Host, isHyperlink, relativeToRoot, s.config.SkipExternalResources, s.allowedCDN)
+		adjusted := resolveURL(baseURL, before, s.URL.Host, isHyperlink, relativeToRoot, s.config.SkipExternalResources, s.allowedCDN, s.pageExtension())
 		if before != adjusted {
 			urls[before] = adjusted
 		}
@@ -185,7 +185,7 @@ func (s *Scraper) fixInlineStyleURL(baseURL *url.URL, node *html.Node, relativeT
 			if s.config.SkipExternalResources && u != nil && u.Host != "" && u.Host != s.URL.Host {
 				return
 			}
-			adjusted := resolveURL(baseURL, before, s.URL.Host, false, relativeToRoot, s.config.SkipExternalResources, s.allowedCDN)
+			adjusted := resolveURL(baseURL, before, s.URL.Host, false, relativeToRoot, s.config.SkipExternalResources, s.allowedCDN, s.pageExtension())
 			if before != adjusted {
 				urls[before] = adjusted
 			}
@@ -212,14 +212,14 @@ func (s *Scraper) fixInlineStyleURL(baseURL *url.URL, node *html.Node, relativeT
 	return false
 }
 
-func resolveSrcSetURLs(base *url.URL, srcSetValue, mainPageHost string, isHyperlink bool, relativeToRoot string, skipExternal bool, allowedCDN set.Set[string]) string {
+func resolveSrcSetURLs(base *url.URL, srcSetValue, mainPageHost string, isHyperlink bool, relativeToRoot string, skipExternal bool, allowedCDN set.Set[string], pageExt ...string) string {
 	// split the set of responsive images
 	values := strings.Split(srcSetValue, ",")
 
 	for i, value := range values {
 		value = strings.TrimSpace(value)
 		parts := strings.Split(value, " ")
-		parts[0] = resolveURL(base, parts[0], mainPageHost, isHyperlink, relativeToRoot, skipExternal, allowedCDN)
+		parts[0] = resolveURL(base, parts[0], mainPageHost, isHyperlink, relativeToRoot, skipExternal, allowedCDN, pageExt...)
 		values[i] = strings.Join(parts, " ")
 	}
 

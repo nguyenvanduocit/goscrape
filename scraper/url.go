@@ -10,7 +10,11 @@ import (
 )
 
 // nolint: cyclop
-func resolveURL(base *url.URL, reference, mainPageHost string, isHyperlink bool, relativeToRoot string, skipExternal bool, allowedCDN set.Set[string]) string {
+func resolveURL(base *url.URL, reference, mainPageHost string, isHyperlink bool, relativeToRoot string, skipExternal bool, allowedCDN set.Set[string], pageExt ...string) string {
+	ext := PageExtension
+	if len(pageExt) > 0 && pageExt[0] != "" {
+		ext = pageExt[0]
+	}
 	ur, err := url.Parse(reference)
 	if err != nil {
 		return ""
@@ -30,19 +34,38 @@ func resolveURL(base *url.URL, reference, mainPageHost string, isHyperlink bool,
 		resolvedURL.Path = filepath.Join("_"+sanitizeHostForPath(ur.Host), resolvedURL.Path)
 	} else {
 		if isHyperlink {
-			ur.Path = getPageFilePath(ur)
+			ur.Path = getPageFilePathWithExt(ur, ext)
 		}
 		resolvedURL = base.ResolveReference(ur)
 	}
 
 	if resolvedURL.Host == mainPageHost {
-		resolvedURL.Path = urlRelativeToOther(resolvedURL, base)
+		resolvedURL.Path = urlRelativeToOther(resolvedURL, base, ext)
 		relativeToRoot = ""
 	}
 
+	// Use the decoded path directly to match how files are saved on disk.
+	// resolvedURL.String() re-encodes special characters (e.g., parentheses become %28/%29),
+	// but getFilePath uses url.Path which is decoded. Using the decoded path ensures
+	// HTML/CSS references match the actual filenames on disk.
 	resolvedURL.Host = ""   // remove host
 	resolvedURL.Scheme = "" // remove http/https
-	resolved := resolvedURL.String()
+
+	// Handle CDN concatenation URLs (e.g., /path/??file1.js,file2.js)
+	// where ?? is parsed as query string. Incorporate first filename into path.
+	if strings.HasPrefix(resolvedURL.RawQuery, "?") {
+		query := strings.TrimPrefix(resolvedURL.RawQuery, "?")
+		if files := strings.SplitN(query, ",", 2); len(files) > 0 && files[0] != "" {
+			resolvedURL.Path = path.Join(resolvedURL.Path, files[0])
+		}
+	}
+
+	resolvedURL.RawQuery = "" // remove query string - files are saved without it
+	resolvedURL.ForceQuery = false
+	resolved := resolvedURL.Path
+	if resolvedURL.Fragment != "" {
+		resolved += "#" + resolvedURL.Fragment
+	}
 
 	if resolved == "" {
 		resolved = "/" // website root
@@ -55,12 +78,13 @@ func resolveURL(base *url.URL, reference, mainPageHost string, isHyperlink bool,
 	}
 
 	if isHyperlink {
+		dirIndex := "index" + ext
 		if resolved[len(resolved)-1] == '/' {
-			resolved += PageDirIndex // link dir index to index.html
+			resolved += dirIndex
 		} else {
 			l := strings.LastIndexByte(resolved, '/')
 			if l != -1 && l < len(resolved) && resolved[l+1] == '#' {
-				resolved = resolved[:l+1] + PageDirIndex + resolved[l+1:] // link fragment correct
+				resolved = resolved[:l+1] + dirIndex + resolved[l+1:]
 			}
 		}
 	}
@@ -82,9 +106,13 @@ func urlRelativeToRoot(url *url.URL) string {
 	return rel.String()
 }
 
-func urlRelativeToOther(src, base *url.URL) string {
+func urlRelativeToOther(src, base *url.URL, pageExt ...string) string {
+	ext := PageExtension
+	if len(pageExt) > 0 && pageExt[0] != "" {
+		ext = pageExt[0]
+	}
 	srcSplits := strings.Split(src.Path, "/")
-	baseSplits := strings.Split(getPageFilePath(base), "/")
+	baseSplits := strings.Split(getPageFilePathWithExt(base, ext), "/")
 
 	for len(srcSplits) > 0 && len(baseSplits) > 0 {
 		if len(srcSplits[0]) == 0 {

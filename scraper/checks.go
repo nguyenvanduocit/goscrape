@@ -3,10 +3,35 @@ package scraper
 
 import (
 	"net/url"
+	"regexp"
 	"strings"
 
 	"github.com/cornelk/gotokit/log"
 )
+
+// defaultExcludePatterns contains compiled regexes for URLs that are almost never
+// useful to scrape (auth pages, MediaWiki special pages, CMS admin endpoints).
+// Compiled once at package init for zero per-request overhead.
+var defaultExcludePatterns []*regexp.Regexp
+
+func init() {
+	rawPatterns := []string{
+		`/wiki/Special:`,
+		`(?i)[?&]title=Special:`,
+		`(?i)/login(/|$|\?)`,
+		`(?i)/logout(/|$|\?)`,
+		`(?i)/signin(/|$|\?)`,
+		`(?i)/signup(/|$|\?)`,
+		`(?i)/register(/|$|\?)`,
+		`(?i)[?&]action=(edit|delete|history|raw|submit|purge|info|protect|unprotect|watch|unwatch|rollback)`,
+		`(?i)[?&]do=(login|register|logout)`,
+		`(?i)/wp-login\.php`,
+		`(?i)/wp-admin(/|$)`,
+	}
+	for _, p := range rawPatterns {
+		defaultExcludePatterns = append(defaultExcludePatterns, regexp.MustCompile(p))
+	}
+}
 
 // normalizeURLPath removes trailing slashes from URL paths for duplicate detection.
 // This treats URLs with and without trailing slashes as the same resource.
@@ -75,6 +100,11 @@ func (s *Scraper) shouldURLBeDownloaded(url *url.URL, currentDepth uint, isAsset
 		return false
 	}
 
+	if !s.config.DisableDefaultExcludes && s.isURLDefaultExcluded(url) {
+		s.logger.Debug("Skipping default-excluded URL", log.String("url", url.String()))
+		return false
+	}
+
 	// Check robots.txt rules if enabled (only for same domain)
 	if s.robotsData != nil && url.Host == s.URL.Host {
 		agent := s.config.UserAgent
@@ -89,6 +119,22 @@ func (s *Scraper) shouldURLBeDownloaded(url *url.URL, currentDepth uint, isAsset
 
 	s.logger.Debug("New URL to download", log.String("url", url.String()))
 	return true
+}
+
+// unmarkURLProcessed removes a URL from the processed set, allowing it to be
+// retried if it's discovered again (e.g., same asset referenced in both HTML and CSS).
+func (s *Scraper) unmarkURLProcessed(u *url.URL) {
+	p := u.String()
+	if u.Host == s.URL.Host {
+		p = u.Path
+	}
+	if p == "" {
+		p = "/"
+	}
+	normalizedPath := normalizeURLPath(p)
+	s.processedMu.Lock()
+	s.processed.Remove(normalizedPath)
+	s.processedMu.Unlock()
 }
 
 func (s *Scraper) isURLIncluded(url *url.URL) bool {
@@ -109,6 +155,21 @@ func (s *Scraper) isURLExcluded(url *url.URL) bool {
 			s.logger.Info("Skipping URL",
 				log.String("url", url.String()),
 				log.Stringer("excluded_expression", re))
+			return true
+		}
+	}
+	return false
+}
+
+// isURLDefaultExcluded checks the URL against the built-in deny list of
+// auth/special page patterns that are almost never useful to scrape.
+func (s *Scraper) isURLDefaultExcluded(u *url.URL) bool {
+	testStr := u.Path
+	if u.RawQuery != "" {
+		testStr += "?" + u.RawQuery
+	}
+	for _, re := range defaultExcludePatterns {
+		if re.MatchString(testStr) {
 			return true
 		}
 	}

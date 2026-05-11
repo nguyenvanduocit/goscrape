@@ -16,3 +16,7 @@
 dist/
 goscrape
 tmp/
+
+# Claude Code local state (per-user, do not commit)
+.claude/
+skills-lock.json

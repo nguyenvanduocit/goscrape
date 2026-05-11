@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,6 +40,13 @@ func TestDownloadURLWithRetries(t *testing.T) {
 	ur, err := url.Parse(svr.URL)
 	require.NoError(t, err)
 
+	origMaxRetries := maxRetries
+	origRetryDelay := retryDelay
+	t.Cleanup(func() {
+		maxRetries = origMaxRetries
+		retryDelay = origRetryDelay
+	})
+
 	maxRetries = 2
 	retryDelay = time.Millisecond
 
@@ -59,4 +67,117 @@ func TestDownloadURLWithRetries(t *testing.T) {
 	retry = -100
 	_, _, err = s.downloadURLWithRetries(ctx, ur)
 	assert.ErrorIs(t, err, errExhaustedRetries)
+}
+
+func TestDownloadURLWithRetries_403NoRetry(t *testing.T) {
+	ctx := context.Background()
+
+	var requestCount int64
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt64(&requestCount, 1)
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer svr.Close()
+
+	ur, err := url.Parse(svr.URL)
+	require.NoError(t, err)
+
+	origMaxRetries := maxRetries
+	origRetryDelay := retryDelay
+	t.Cleanup(func() {
+		maxRetries = origMaxRetries
+		retryDelay = origRetryDelay
+	})
+	maxRetries = 5
+	retryDelay = time.Millisecond
+
+	logger := log.NewTestLogger(t)
+	s, err := New(logger, Config{})
+	require.NoError(t, err)
+
+	_, _, err = s.downloadURLWithRetries(ctx, ur)
+	require.Error(t, err)
+	assert.True(t, IsHTTPStatusError(err, http.StatusForbidden))
+	// 403 is not retryable, so only 1 request should have been made.
+	assert.Equal(t, int64(1), atomic.LoadInt64(&requestCount))
+}
+
+func TestDownloadURLWithRetries_RetryAfterSeconds(t *testing.T) {
+	ctx := context.Background()
+
+	var attempt int64
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := atomic.AddInt64(&attempt, 1)
+		if n == 1 {
+			w.Header().Set("Retry-After", "2")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_, _ = fmt.Fprint(w, "ok")
+	}))
+	defer svr.Close()
+
+	ur, err := url.Parse(svr.URL)
+	require.NoError(t, err)
+
+	origMaxRetries := maxRetries
+	origRetryDelay := retryDelay
+	t.Cleanup(func() {
+		maxRetries = origMaxRetries
+		retryDelay = origRetryDelay
+	})
+	maxRetries = 3
+	retryDelay = 100 * time.Millisecond // much smaller than Retry-After=2s
+
+	logger := log.NewTestLogger(t)
+	s, err := New(logger, Config{})
+	require.NoError(t, err)
+
+	start := time.Now()
+	b, _, err := s.downloadURLWithRetries(ctx, ur)
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	assert.Equal(t, "ok", string(b))
+	// Retry-After=2 means sleep ~2s; without it, sleep would be ~100ms.
+	assert.GreaterOrEqual(t, elapsed, 1900*time.Millisecond,
+		"should have slept at least ~2s due to Retry-After header")
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected time.Duration
+	}{
+		{"empty", "", 0},
+		{"seconds_2", "2", 2 * time.Second},
+		{"seconds_0", "0", 0},
+		{"seconds_negative", "-1", 0},
+		{"seconds_large_capped", "600", 5 * time.Minute},
+		{"garbage", "not-a-number-or-date", 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseRetryAfter(tt.input)
+			assert.Equal(t, tt.expected, got)
+		})
+	}
+
+	// HTTP-date in the future
+	t.Run("http_date_future", func(t *testing.T) {
+		future := time.Now().Add(30 * time.Second).UTC().Format(http.TimeFormat)
+		got := parseRetryAfter(future)
+		// Should be roughly 30s (allow 25-35s for test timing)
+		assert.Greater(t, got, 25*time.Second)
+		assert.Less(t, got, 35*time.Second)
+	})
+
+	// HTTP-date in the past
+	t.Run("http_date_past", func(t *testing.T) {
+		past := time.Now().Add(-10 * time.Second).UTC().Format(http.TimeFormat)
+		got := parseRetryAfter(past)
+		assert.Equal(t, time.Duration(0), got)
+	})
 }

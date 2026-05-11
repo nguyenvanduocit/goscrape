@@ -159,3 +159,66 @@ func TestShouldURLBeDownloaded_ExternalURLs(t *testing.T) {
 	normalizedURL1 := normalizeURLPath(url1.String())
 	assert.True(t, scraper.processed.Contains(normalizedURL1))
 }
+
+func TestShouldURLBeDownloaded_DefaultExcludes(t *testing.T) {
+	tests := []struct {
+		name    string
+		rawURL  string
+		allowed bool
+	}{
+		{"mediawiki_special", "https://example.com/wiki/Special:UserLogin", false},
+		{"mediawiki_special_subpath", "https://example.com/mediawiki/wiki/Special:UserLogin", false},
+		{"mediawiki_special_query", "https://example.com/w/index.php?title=Special:UserLogin&action=raw", false},
+		{"login", "https://example.com/login", false},
+		{"login_uppercase", "https://example.com/Login", false},
+		{"signup_query", "https://example.com/signup?ref=x", false},
+		{"wp_login", "https://example.com/wp-login.php", false},
+		{"action_edit", "https://example.com/wiki/Page?action=edit&page=Foo", false},
+		{"action_edit_not_first_param", "https://example.com/wiki/Page?title=Foo&action=edit", false},
+		{"action_history", "https://example.com/wiki/Page?action=history", false},
+		{"wp_admin", "https://example.com/wp-admin/post.php", false},
+		{"logout", "https://example.com/logout", false},
+		{"register", "https://example.com/register?next=/home", false},
+		{"do_login", "https://example.com/doku.php?do=login", false},
+		{"do_login_not_first_param", "https://example.com/doku.php?page=start&do=login", false},
+		{"normal_article", "https://example.com/wiki/Article", true},
+		{"about_page", "https://example.com/about", true},
+		{"root", "https://example.com/", true},
+		{"blog_post", "https://example.com/blog/my-post", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger := log.NewTestLogger(t)
+			cfg := Config{URL: "https://example.com"}
+			s, err := New(logger, cfg)
+			require.NoError(t, err)
+			s.processed = set.New[string]()
+
+			u, err := url.Parse(tt.rawURL)
+			require.NoError(t, err)
+
+			got := s.shouldURLBeDownloaded(u, 0, false)
+			assert.Equal(t, tt.allowed, got, "URL: %s", tt.rawURL)
+		})
+	}
+}
+
+func TestShouldURLBeDownloaded_DisableDefaultExcludes(t *testing.T) {
+	logger := log.NewTestLogger(t)
+	cfg := Config{
+		URL:                    "https://example.com",
+		DisableDefaultExcludes: true,
+	}
+	s, err := New(logger, cfg)
+	require.NoError(t, err)
+	s.processed = set.New[string]()
+
+	// /login would normally be excluded by default deny list, but is allowed
+	// when DisableDefaultExcludes is true.
+	u, err := url.Parse("https://example.com/login")
+	require.NoError(t, err)
+
+	got := s.shouldURLBeDownloaded(u, 0, false)
+	assert.True(t, got, "/login should be allowed when default excludes are disabled")
+}

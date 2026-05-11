@@ -56,23 +56,26 @@ func (s *Scraper) downloadReferences(ctx context.Context, index *htmlindex.Index
 	// Collect all tasks
 	var tasks []downloadTask //nolint:prealloc
 
-	for _, tag := range tagsWithReferences {
-		references, err = index.URLs(tag)
-		if err != nil {
-			s.logger.Error("Getting node URLs failed",
-				log.String("node", tag),
-				log.Err(err))
-		}
+	// Skip CSS/JS downloads in markdown mode — only images/fonts/media are needed.
+	if !s.config.Markdown {
+		for _, tag := range tagsWithReferences {
+			references, err = index.URLs(tag)
+			if err != nil {
+				s.logger.Error("Getting node URLs failed",
+					log.String("node", tag),
+					log.Err(err))
+			}
 
-		var processor assetProcessor
-		switch tag {
-		case htmlindex.LinkTag, htmlindex.StyleTag, htmlindex.InlineStyleTag:
-			processor = s.cssProcessor
-		case htmlindex.ScriptTag:
-			processor = s.jsProcessor
-		}
-		for _, ur := range references {
-			tasks = append(tasks, downloadTask{url: ur, processor: processor})
+			var processor assetProcessor
+			switch tag {
+			case htmlindex.LinkTag, htmlindex.StyleTag, htmlindex.InlineStyleTag:
+				processor = s.cssProcessor
+			case htmlindex.ScriptTag:
+				processor = s.jsProcessor
+			}
+			for _, ur := range references {
+				tasks = append(tasks, downloadTask{url: ur, processor: processor})
+			}
 		}
 	}
 
@@ -200,21 +203,28 @@ func (s *Scraper) downloadAsset(ctx context.Context, u *url.URL, processor asset
 	filePath := s.getFilePath(u, false)
 	if s.fileExists(filePath) {
 		s.incrementProgress()
+		s.emit(Event{Kind: EventSkipped, URL: urlFull, Message: "asset exists on disk"})
 		return nil
 	}
 
 	s.logger.Info("Downloading asset", log.String("url", urlFull))
+	s.emit(Event{Kind: EventAssetStart, URL: urlFull})
 	data, _, err := s.httpDownloader(ctx, u)
 	if err != nil {
 		// Skip silently if configured and error is 403 Forbidden
 		if s.config.Skip403 && IsHTTPStatusError(err, http.StatusForbidden) {
 			s.incrementProgress()
+			s.emit(Event{Kind: EventSkipped, URL: urlFull, Message: "asset 403, skipped"})
 			return nil
 		}
+		// Unmark failed asset so it can be retried if discovered again
+		// (e.g., same image referenced in both HTML and CSS)
+		s.unmarkURLProcessed(u)
 		s.logger.Error("Downloading asset failed",
 			log.String("url", urlFull),
 			log.Err(err))
 		s.addFailedURL(urlFull, err)
+		s.emit(Event{Kind: EventFailed, URL: urlFull, Err: err.Error()})
 		return fmt.Errorf("downloading asset: %w", err)
 	}
 
@@ -230,6 +240,7 @@ func (s *Scraper) downloadAsset(ctx context.Context, u *url.URL, processor asset
 	}
 
 	s.incrementProgress()
+	s.emit(Event{Kind: EventAssetDone, URL: urlFull})
 	return nil
 }
 
@@ -386,7 +397,7 @@ func (s *Scraper) rewriteCDNBases(jsData string) string {
 
 // maxJSProcessSize is the maximum JS file size (bytes) to process for URL extraction.
 // Large minified bundles produce excessive false positives and slow regex scans.
-const maxJSProcessSize = 512 * 1024
+const maxJSProcessSize = 2 * 1024 * 1024
 
 // jsProcessor processes JavaScript files to extract and rewrite URLs.
 func (s *Scraper) jsProcessor(baseURL *url.URL, data []byte) []byte {
@@ -429,6 +440,19 @@ func (s *Scraper) jsProcessor(baseURL *url.URL, data []byte) []byte {
 	}
 
 	s.enqueueAssets(discovered)
+
+	// Rewrite same-domain absolute base URLs (e.g., "https://www.example.com/path/")
+	// to relative paths (e.g., "/path/"). These are used by JS for dynamic URL construction.
+	// Check both http and https since the initial URL scheme may differ from what JS uses.
+	for _, scheme := range []string{"https", "http"} {
+		mainBase := scheme + "://" + s.URL.Host
+		for _, quote := range []string{`"`, `'`, "`"} {
+			prefix := quote + mainBase
+			if strings.Contains(jsData, prefix) {
+				urls[prefix] = quote
+			}
+		}
+	}
 
 	var jsReplacerPairs []string
 	for ori, filePath := range urls {

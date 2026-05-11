@@ -194,6 +194,221 @@ h3 {
 	assert.Contains(t, content, "url("+file3Reference+")")
 }
 
+func TestStart_403OnStartPage_ReturnsError(t *testing.T) {
+	logger := log.NewTestLogger(t)
+	cfg := Config{
+		URL: "https://example.org/",
+	}
+	s, err := New(logger, cfg)
+	require.NoError(t, err)
+
+	s.dirCreator = func(_ string) error { return nil }
+	s.fileWriter = func(_ string, _ []byte) error { return nil }
+	s.fileExistenceCheck = func(_ string) bool { return false }
+	s.httpDownloader = func(_ context.Context, u *url.URL) ([]byte, *url.URL, error) {
+		return nil, nil, &HTTPStatusError{StatusCode: 403, URL: u.String()}
+	}
+
+	err = s.Start(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "403 Forbidden")
+}
+
+func TestProcessURL_403OnSubpage_ContinuesCrawling(t *testing.T) {
+	indexPage := []byte(`
+<html><body>
+<a href="https://example.org/secret">secret</a>
+<a href="https://example.org/public">public</a>
+</body></html>
+`)
+	publicPage := []byte(`<html><body>public content</body></html>`)
+
+	startURL := "https://example.org/"
+	urls := map[string][]byte{
+		"https://example.org/":       indexPage,
+		"https://example.org/public": publicPage,
+	}
+
+	s := newTestScraper(t, startURL, urls)
+	// Override downloader to return 403 for /secret
+	origDownloader := s.httpDownloader
+	s.httpDownloader = func(ctx context.Context, u *url.URL) ([]byte, *url.URL, error) {
+		if u.Path == "/secret" {
+			return nil, nil, &HTTPStatusError{StatusCode: 403, URL: u.String()}
+		}
+		return origDownloader(ctx, u)
+	}
+
+	err := s.Start(context.Background())
+	require.NoError(t, err, "403 on subpage should not abort the crawl")
+	assert.True(t, s.processed.Contains("/public"))
+}
+
+func TestProcessURL_SkipExisting_FileExists_SkipsDownload(t *testing.T) {
+	indexPage := []byte(`
+<html><body>
+<a href="https://example.org/child1">child1</a>
+<a href="https://example.org/child2">child2</a>
+</body></html>
+`)
+	startURL := "https://example.org/"
+
+	logger := log.NewTestLogger(t)
+	cfg := Config{
+		URL:          startURL,
+		SkipExisting: true,
+	}
+	s, err := New(logger, cfg)
+	require.NoError(t, err)
+
+	// Track HTTP download calls
+	var downloadCount int
+	s.httpDownloader = func(_ context.Context, u *url.URL) ([]byte, *url.URL, error) {
+		downloadCount++
+		if u.String() == startURL {
+			return indexPage, u, nil
+		}
+		return nil, nil, fmt.Errorf("unexpected download: %s", u.String())
+	}
+	s.dirCreator = func(_ string) error { return nil }
+	s.fileWriter = func(_ string, _ []byte) error { return nil }
+
+	// Simulate that the file for the start page already exists
+	startFilePath := s.getFilePath(s.URL, true)
+	s.fileExistenceCheck = func(filePath string) bool {
+		return filePath == startFilePath
+	}
+
+	err = s.Start(context.Background())
+	require.NoError(t, err)
+
+	// Start page file exists → should NOT have been downloaded
+	assert.Equal(t, 0, downloadCount, "no HTTP downloads should occur when file exists")
+	// Children should NOT be queued (URLs are rewritten in cached files)
+	assert.Equal(t, 0, len(s.webPageQueue), "no children should be queued from skipped pages")
+}
+
+func TestProcessURL_SkipExisting_FileMissing_FallsThrough(t *testing.T) {
+	indexPage := []byte(`
+<html><body>
+<a href="https://example.org/child1">child1</a>
+</body></html>
+`)
+	child1Page := []byte(`<html><body>child content</body></html>`)
+	startURL := "https://example.org/"
+	urls := map[string][]byte{
+		"https://example.org/":       indexPage,
+		"https://example.org/child1": child1Page,
+	}
+
+	logger := log.NewTestLogger(t)
+	cfg := Config{
+		URL:          startURL,
+		SkipExisting: true,
+	}
+	s, err := New(logger, cfg)
+	require.NoError(t, err)
+
+	var downloadCount int
+	s.httpDownloader = func(_ context.Context, u *url.URL) ([]byte, *url.URL, error) {
+		downloadCount++
+		ur := u.String()
+		b, ok := urls[ur]
+		if ok {
+			return b, u, nil
+		}
+		return nil, nil, fmt.Errorf("url '%s' not found", ur)
+	}
+	s.dirCreator = func(_ string) error { return nil }
+	s.fileWriter = func(_ string, _ []byte) error { return nil }
+	// File does NOT exist on disk → should fall through to download
+	s.fileExistenceCheck = func(_ string) bool { return false }
+
+	err = s.Start(context.Background())
+	require.NoError(t, err)
+
+	// Both start page and child1 should have been downloaded
+	assert.Equal(t, 2, downloadCount, "both pages should be downloaded when files don't exist")
+	assert.True(t, s.processed.Contains("/child1"))
+}
+
+func TestProcessURL_SkipExistingMarkdown_NoChildren(t *testing.T) {
+	startURL := "https://example.org/"
+
+	logger := log.NewTestLogger(t)
+	cfg := Config{
+		URL:          startURL,
+		Markdown:     true,
+		SkipExisting: true,
+	}
+	s, err := New(logger, cfg)
+	require.NoError(t, err)
+
+	var downloadCount int
+	s.httpDownloader = func(_ context.Context, u *url.URL) ([]byte, *url.URL, error) {
+		downloadCount++
+		return nil, nil, fmt.Errorf("should not be called")
+	}
+	s.dirCreator = func(_ string) error { return nil }
+	s.fileWriter = func(_ string, _ []byte) error { return nil }
+
+	// Simulate that the markdown file exists
+	startFilePath := s.getFilePath(s.URL, true)
+	s.fileExistenceCheck = func(filePath string) bool {
+		return filePath == startFilePath
+	}
+
+	err = s.Start(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 0, downloadCount, "no downloads when .md file exists")
+	assert.Equal(t, 0, len(s.webPageQueue), "no children queued from skipped markdown page")
+}
+
+// TestURLRewriteVerification empirically confirms that saved HTML has URLs
+// rewritten to local paths. This justifies the decision to skip children
+// for cached pages: re-parsing would yield local paths, not valid HTTP URLs.
+func TestURLRewriteVerification(t *testing.T) {
+	indexPage := []byte(`
+<html><body>
+<a href="https://example.org/page2">link</a>
+<a href="/page3">another</a>
+</body></html>
+`)
+
+	startURL := "https://example.org/"
+	urls := map[string][]byte{
+		"https://example.org/": indexPage,
+	}
+
+	s := newTestScraper(t, startURL, urls)
+
+	savedFiles := map[string][]byte{}
+	s.fileWriter = func(filePath string, data []byte) error {
+		savedFiles[filePath] = data
+		return nil
+	}
+
+	// Only process the start page (don't follow children)
+	err := s.processURL(context.Background(), s.URL, 0)
+	require.NoError(t, err)
+
+	// Find the saved HTML
+	var savedHTML []byte
+	for _, data := range savedFiles {
+		savedHTML = data
+		break
+	}
+	require.NotNil(t, savedHTML, "expected HTML file to be saved")
+
+	content := string(savedHTML)
+	// Verify that href values have been rewritten to local paths with .html extension
+	// (not the original HTTP URLs)
+	assert.Contains(t, content, "page2.html", "href should be rewritten to local .html path")
+	assert.Contains(t, content, "page3.html", "href should be rewritten to local .html path")
+	assert.NotContains(t, content, "https://example.org/page2", "original HTTP URL should be rewritten")
+	t.Logf("Saved HTML confirms URL rewrite: %s", content)
+}
+
 func TestScraperInlineStyleAttribute(t *testing.T) {
 	indexPage := []byte(`
 <html>

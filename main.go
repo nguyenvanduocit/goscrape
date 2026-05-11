@@ -10,7 +10,9 @@ import (
 	"strings"
 
 	"github.com/alexflint/go-arg"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/cornelk/goscrape/scraper"
+	"github.com/cornelk/goscrape/scraper/tui"
 	"github.com/cornelk/gotokit/app"
 	"github.com/cornelk/gotokit/buildinfo"
 	"github.com/cornelk/gotokit/env"
@@ -44,10 +46,12 @@ type arguments struct {
 	User      string   `arg:"-u,--user" help:"user[:password] to use for HTTP authentication"`
 	UserAgent string   `arg:"-a,--useragent" help:"user agent to use for scraping"`
 
-	Verbose bool `arg:"-v,--verbose" help:"verbose output"`
+	Verbose  bool `arg:"-v,--verbose" help:"verbose output"`
+	Markdown bool `arg:"-m,--markdown" help:"convert HTML pages to Markdown (.md) instead of HTML"`
+	TUI      bool `arg:"--tui" help:"run with interactive TUI dashboard (disables progress bar and silences logs)"`
 
 	IncludeExternal bool     `arg:"-e,--include-external" help:"include external resources from other domains"`
-	AllowCDN        []string `arg:"--allow-cdn" help:"allow external assets from specific CDN domains (e.g., cdn.example.com)"`
+	AllowCDN        []string `arg:"--allow-cdn,separate" help:"allow external assets from specific CDN domains (e.g., cdn.example.com)"`
 
 	// Concurrency and rate limiting
 	Concurrency int     `arg:"-j,--concurrency" help:"number of concurrent asset downloads" default:"4"`
@@ -62,7 +66,13 @@ type arguments struct {
 	RespectRobots bool `arg:"--respect-robots" help:"respect robots.txt rules"`
 
 	// Skip 403
-	Skip403 bool `arg:"--skip-403" help:"silently skip URLs that return 403 Forbidden instead of logging errors"`
+	Skip403 bool `arg:"--skip-403" help:"silently skip asset URLs that return 403 Forbidden instead of logging errors"`
+
+	// Default excludes
+	NoDefaultExcludes bool `arg:"--no-default-excludes" help:"disable built-in deny list for auth/special pages (login, signup, MediaWiki Special:*, etc.)"`
+
+	// Skip existing
+	SkipExisting bool `arg:"--skip-existing" help:"skip download if the target file already exists on disk; useful for resuming an interrupted crawl"`
 }
 
 func (arguments) Description() string {
@@ -85,9 +95,29 @@ func main() {
 	if args.Verbose {
 		log.SetDefaultLevel(log.DebugLevel)
 	}
-	logger, err := createLogger()
-	if err != nil {
-		fmt.Printf("Creating logger failed: %s\n", err)
+
+	// In TUI mode any log line written to stderr/stdout would scramble the
+	// rendered frame. Discard all log output and rely on the dashboard +
+	// failed-URL log file for visibility.
+	var logger *log.Logger
+	if args.TUI {
+		logger = log.NewNop()
+	} else {
+		var err error
+		logger, err = createLogger()
+		if err != nil {
+			fmt.Printf("Creating logger failed: %s\n", err)
+			os.Exit(1)
+		}
+	}
+
+	if args.Serve != "" && args.Markdown {
+		fmt.Println("--markdown is not supported with --serve")
+		os.Exit(1)
+	}
+
+	if args.Serve != "" && args.TUI {
+		fmt.Println("--tui is not supported with --serve")
 		os.Exit(1)
 	}
 
@@ -183,7 +213,9 @@ func runScraper(ctx context.Context, args arguments, logger *log.Logger) error {
 		Delay:       uint(args.Delay),
 
 		// Progress and logging
-		ShowProgress: !args.NoProgress,
+		// In TUI mode the dashboard owns the screen; the progressbar would
+		// fight it for stdout, so force-disable.
+		ShowProgress: !args.NoProgress && !args.TUI,
 		ErrorLogFile: args.ErrorLogFile,
 
 		// robots.txt
@@ -191,6 +223,15 @@ func runScraper(ctx context.Context, args arguments, logger *log.Logger) error {
 
 		// Skip 403
 		Skip403: args.Skip403,
+
+		// Default excludes
+		DisableDefaultExcludes: args.NoDefaultExcludes,
+
+		// Markdown mode
+		Markdown: args.Markdown,
+
+		// Skip existing
+		SkipExisting: args.SkipExisting,
 	}
 
 	return scrapeURLs(ctx, cfg, logger, args)
@@ -201,34 +242,104 @@ func scrapeURLs(ctx context.Context, cfg scraper.Config,
 
 	for _, url := range args.URLs {
 		cfg.URL = url
-		sc, err := scraper.New(logger, cfg)
-		if err != nil {
-			return fmt.Errorf("initializing scraper: %w", err)
-		}
 
-		logger.Info("Scraping", log.String("url", sc.URL.String()))
-		if err = sc.Start(ctx); err != nil {
-			if errors.Is(err, context.Canceled) {
+		var runErr error
+		if args.TUI {
+			runErr = runWithTUI(ctx, cfg, logger, args)
+		} else {
+			runErr = runScrape(ctx, cfg, logger, args)
+		}
+		if runErr != nil {
+			if errors.Is(runErr, context.Canceled) {
 				os.Exit(0)
 			}
-
-			return fmt.Errorf("scraping '%s': %w", sc.URL, err)
-		}
-
-		if args.SaveCookieFile != "" {
-			if err := saveCookies(args.SaveCookieFile, sc.Cookies()); err != nil {
-				return fmt.Errorf("saving cookies: %w", err)
-			}
-		}
-
-		// Write failed URLs to error log file
-		if args.ErrorLogFile != "" {
-			if err := writeErrorLog(args.ErrorLogFile, sc.FailedURLs()); err != nil {
-				return fmt.Errorf("writing error log: %w", err)
-			}
+			return runErr
 		}
 	}
+	return nil
+}
 
+// runScrape executes a single scrape in plain (non-TUI) mode using the
+// existing logger + optional progressbar path.
+func runScrape(ctx context.Context, cfg scraper.Config,
+	logger *log.Logger, args arguments) error {
+
+	sc, err := scraper.New(logger, cfg)
+	if err != nil {
+		return fmt.Errorf("initializing scraper: %w", err)
+	}
+
+	logger.Info("Scraping", log.String("url", sc.URL.String()))
+	if err = sc.Start(ctx); err != nil {
+		return fmt.Errorf("scraping '%s': %w", sc.URL, err)
+	}
+
+	return finalizeScrape(sc, args)
+}
+
+// runWithTUI executes a single scrape with the Bubbletea dashboard.
+// The scraper runs on a goroutine; the tea.Program owns the foreground
+// thread. Events flow scraper → tea.Program.Send → Model.Update.
+func runWithTUI(ctx context.Context, cfg scraper.Config,
+	logger *log.Logger, args arguments) error {
+
+	// Build the program first so we can route events into it before Start.
+	model := tui.New(cfg.URL)
+	program := tea.NewProgram(model, tea.WithAltScreen())
+
+	handler, stopHandler := tui.NewEventHandler(program)
+	cfg.OnEvent = handler
+
+	sc, err := scraper.New(logger, cfg)
+	if err != nil {
+		stopHandler()
+		return fmt.Errorf("initializing scraper: %w", err)
+	}
+
+	// Run the scraper in the background; surface completion to the TUI so
+	// it can render a final frame and exit. Use a cancellable context so
+	// pressing 'q' aborts an in-flight crawl instead of waiting for it.
+	scrapeCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var scrapeErr error
+	doneCh := make(chan struct{})
+	go func() {
+		scrapeErr = sc.Start(scrapeCtx)
+		program.Send(tui.DoneMsg{Err: scrapeErr})
+		close(doneCh)
+	}()
+
+	// Run blocks until the TUI quits (user pressed q OR scraper finished
+	// and the auto-quit timer fired).
+	_, runErr := program.Run()
+	cancel()       // ensure scraper goroutine notices if user quit early
+	stopHandler()  // prevent Send-after-Run
+	<-doneCh       // wait for scraper to fully unwind before continuing
+
+	if runErr != nil {
+		return fmt.Errorf("running TUI: %w", runErr)
+	}
+	if scrapeErr != nil && !errors.Is(scrapeErr, context.Canceled) {
+		return fmt.Errorf("scraping '%s': %w", sc.URL, scrapeErr)
+	}
+
+	return finalizeScrape(sc, args)
+}
+
+// finalizeScrape persists cookies and failed-URL log after a scrape ends.
+// Shared between TUI and plain mode so behaviour stays identical.
+func finalizeScrape(sc *scraper.Scraper, args arguments) error {
+	if args.SaveCookieFile != "" {
+		if err := saveCookies(args.SaveCookieFile, sc.Cookies()); err != nil {
+			return fmt.Errorf("saving cookies: %w", err)
+		}
+	}
+	if args.ErrorLogFile != "" {
+		if err := writeErrorLog(args.ErrorLogFile, sc.FailedURLs()); err != nil {
+			return fmt.Errorf("writing error log: %w", err)
+		}
+	}
 	return nil
 }
 
