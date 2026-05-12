@@ -1,0 +1,763 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>goscrape — An Instrument for the Preservation of the Web</title>
+<meta name="description" content="A console utility, written in Go, for downloading websites into a quiet, browsable archive on disk." />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&amp;family=Fraunces:ital,opsz,wght@0,9..144,300..900;1,9..144,300..900&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap" rel="stylesheet" />
+<style>
+  :root{
+    --paper:#efe7da;
+    --paper-deep:#e4d9c5;
+    --ink:#181410;
+    --ink-mute:#5b4f43;
+    --oxide:#a03b1f;
+    --slate:#3b5366;
+    --rule:#1814101a;
+    --serif:"Fraunces","Instrument Serif",Georgia,serif;
+    --display:"Instrument Serif","Fraunces",Georgia,serif;
+    --mono:"JetBrains Mono",ui-monospace,Menlo,monospace;
+  }
+
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  html{background:var(--paper)}
+  body{
+    font-family:var(--serif);
+    font-variation-settings:"opsz" 12,"SOFT" 30;
+    color:var(--ink);
+    line-height:1.55;
+    font-size:18px;
+    -webkit-font-smoothing:antialiased;
+    text-rendering:optimizeLegibility;
+    overflow-x:hidden;
+    background:
+      radial-gradient(1200px 700px at 8% -10%, #f5ecdb 0%, transparent 65%),
+      radial-gradient(900px 600px at 110% 30%, #ead9b8 0%, transparent 60%),
+      var(--paper);
+    position:relative;
+  }
+
+  /* paper grain */
+  body::before{
+    content:"";
+    position:fixed; inset:0;
+    pointer-events:none;
+    z-index:1000;
+    mix-blend-mode:multiply;
+    opacity:.18;
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0.09 0 0 0 0 0.08 0 0 0 0 0.06 0 0 0 0.5 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
+  }
+  /* paper edge vignette */
+  body::after{
+    content:"";
+    position:fixed; inset:0;
+    pointer-events:none;
+    z-index:999;
+    box-shadow:inset 0 0 220px rgba(24,20,16,.18);
+  }
+
+  ::selection{background:var(--oxide);color:var(--paper)}
+
+  a{color:var(--slate);text-decoration:none;background-image:linear-gradient(var(--slate),var(--slate));background-size:100% 1px;background-repeat:no-repeat;background-position:0 100%;transition:background-size .35s ease}
+  a:hover{background-size:0 1px}
+
+  .wrap{
+    max-width:1240px;
+    margin:0 auto;
+    padding:0 clamp(24px,4vw,72px);
+    position:relative;
+  }
+
+  /* ---------- MASTHEAD ---------- */
+  .masthead{
+    padding:28px 0 18px;
+    border-bottom:1px solid var(--ink);
+    display:grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items:end;
+    gap:24px;
+    font-family:var(--mono);
+    font-size:11px;
+    letter-spacing:.18em;
+    text-transform:uppercase;
+  }
+  .masthead .left,.masthead .right{color:var(--ink-mute)}
+  .masthead .right{text-align:right}
+  .masthead .center{
+    font-family:var(--display);
+    font-style:italic;
+    text-transform:none;
+    letter-spacing:0;
+    font-size:14px;
+    color:var(--ink);
+  }
+  .masthead .center span{font-style:normal;font-family:var(--mono);font-size:10px;letter-spacing:.2em;color:var(--ink-mute);display:block;text-transform:uppercase;margin-top:4px}
+
+  .submast{
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    padding:10px 0 0;
+    font-family:var(--mono);
+    font-size:10.5px;
+    letter-spacing:.22em;
+    text-transform:uppercase;
+    color:var(--ink-mute);
+  }
+  .submast .crest{
+    display:inline-flex;align-items:center;gap:10px;
+  }
+  .crest .glyph{
+    width:18px;height:18px;border:1px solid var(--ink);
+    display:inline-grid;place-items:center;
+    color:var(--ink);font-family:var(--display);font-style:italic;font-size:13px;
+    transform:translateY(-1px);
+  }
+
+  /* ---------- HERO ---------- */
+  .hero{
+    padding:clamp(48px,9vw,128px) 0 clamp(40px,7vw,96px);
+    border-bottom:1px solid var(--ink);
+    position:relative;
+  }
+  .eyebrow{
+    font-family:var(--mono);
+    font-size:11px;
+    letter-spacing:.28em;
+    text-transform:uppercase;
+    color:var(--oxide);
+    margin-bottom:28px;
+    display:inline-flex;align-items:center;gap:12px;
+  }
+  .eyebrow::before,.eyebrow::after{content:"";display:inline-block;width:32px;height:1px;background:var(--oxide)}
+
+  h1.headline{
+    font-family:var(--display);
+    font-weight:400;
+    font-size:clamp(56px, 11vw, 168px);
+    line-height:.92;
+    letter-spacing:-0.02em;
+    margin:0;
+    color:var(--ink);
+  }
+  h1.headline em{
+    font-family:var(--display);
+    font-style:italic;
+    color:var(--oxide);
+  }
+  h1.headline .small{
+    display:block;
+    font-family:var(--serif);
+    font-style:italic;
+    font-weight:300;
+    font-size:.22em;
+    letter-spacing:0;
+    color:var(--ink-mute);
+    margin-top:.6em;
+    line-height:1.3;
+    max-width:18ch;
+  }
+
+  .hero-grid{
+    margin-top:clamp(40px,6vw,72px);
+    display:grid;
+    grid-template-columns: 1.1fr 1fr;
+    gap:clamp(28px,5vw,72px);
+    align-items:start;
+  }
+  .lede{
+    font-family:var(--serif);
+    font-size:clamp(20px,1.6vw,24px);
+    line-height:1.45;
+    font-weight:350;
+    color:var(--ink);
+    max-width:34ch;
+  }
+  .lede::first-letter{
+    font-family:var(--display);
+    float:left;
+    font-size:5.4em;
+    line-height:.78;
+    padding:.05em .08em 0 0;
+    color:var(--oxide);
+    font-style:italic;
+  }
+
+  .specimen{
+    border:1px solid var(--ink);
+    background:rgba(255,255,255,.35);
+    padding:18px 22px 20px;
+    font-family:var(--mono);
+    font-size:13px;
+    line-height:1.7;
+    color:var(--ink);
+    position:relative;
+    box-shadow:6px 6px 0 var(--ink);
+  }
+  .specimen-label{
+    position:absolute;
+    top:-9px;left:18px;
+    background:var(--paper);
+    padding:0 8px;
+    font-family:var(--mono);
+    font-size:10px;
+    letter-spacing:.24em;
+    text-transform:uppercase;
+    color:var(--ink-mute);
+  }
+  .specimen .prompt{color:var(--oxide);user-select:none}
+  .specimen .out{color:var(--ink-mute)}
+  .specimen .flag{color:var(--slate)}
+
+  /* CTA */
+  .cta{
+    margin-top:28px;
+    display:flex;flex-wrap:wrap;gap:16px;align-items:center;
+  }
+  .btn{
+    display:inline-flex;align-items:center;gap:10px;
+    font-family:var(--mono);
+    font-size:12px;letter-spacing:.22em;text-transform:uppercase;
+    padding:14px 22px;
+    border:1px solid var(--ink);
+    background:var(--ink);
+    color:var(--paper);
+    background-image:none;
+    background-size:0;
+    transition:transform .25s ease, background .25s ease, color .25s ease;
+  }
+  .btn:hover{background:var(--oxide);border-color:var(--oxide);color:var(--paper);transform:translate(-1px,-1px)}
+  .btn.ghost{background:transparent;color:var(--ink)}
+  .btn.ghost:hover{background:var(--ink);color:var(--paper)}
+
+  /* ---------- SECTION COMMONS ---------- */
+  section.section{
+    padding:clamp(56px,9vw,128px) 0;
+    border-bottom:1px solid var(--ink);
+    position:relative;
+  }
+  .sec-head{
+    display:grid;
+    grid-template-columns: auto 1fr;
+    gap:28px;
+    align-items:end;
+    margin-bottom:clamp(36px,5vw,64px);
+  }
+  .sec-no{
+    font-family:var(--mono);
+    font-size:11px;letter-spacing:.28em;text-transform:uppercase;
+    color:var(--oxide);
+    border-top:1px solid var(--oxide);
+    padding-top:8px;
+    min-width:120px;
+  }
+  .sec-title{
+    font-family:var(--display);
+    font-weight:400;
+    font-size:clamp(36px,5.6vw,72px);
+    line-height:1;
+    letter-spacing:-.01em;
+    margin:0;
+  }
+  .sec-title em{font-style:italic;color:var(--oxide)}
+
+  .gutter-grid{
+    display:grid;
+    grid-template-columns:160px 1fr;
+    gap:48px;
+  }
+  .marginalia{
+    font-family:var(--mono);
+    font-size:11px;
+    letter-spacing:.18em;
+    text-transform:uppercase;
+    color:var(--ink-mute);
+    line-height:1.7;
+    border-top:1px solid var(--rule);
+    padding-top:8px;
+  }
+  .marginalia b{color:var(--oxide);font-weight:500}
+
+  /* ---------- §01 INSTALL ---------- */
+  .install-grid{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:32px;
+  }
+  .card{
+    border:1px solid var(--ink);
+    padding:32px;
+    background:rgba(255,255,255,.25);
+    position:relative;
+    transition:transform .3s ease, box-shadow .3s ease;
+  }
+  .card:hover{transform:translate(-2px,-2px);box-shadow:8px 8px 0 var(--ink)}
+  .card .num{
+    font-family:var(--display);
+    font-style:italic;
+    font-size:48px;line-height:1;color:var(--oxide);
+    margin-bottom:18px;
+  }
+  .card h3{
+    font-family:var(--display);
+    font-weight:400;
+    font-size:28px;
+    line-height:1.1;
+    margin:0 0 12px;
+    letter-spacing:-.01em;
+  }
+  .card p{
+    font-size:15px;
+    line-height:1.55;
+    color:var(--ink-mute);
+    margin:0 0 18px;
+  }
+  .card .specimen{margin-top:auto;padding:14px 16px;box-shadow:none;background:var(--paper-deep)}
+
+  /* ---------- §02 USAGE ---------- */
+  .usage-list{
+    display:flex;flex-direction:column;gap:48px;
+  }
+  .usage{
+    display:grid;
+    grid-template-columns:auto 1fr 1.1fr;
+    gap:32px;
+    align-items:start;
+    padding-top:32px;
+    border-top:1px dashed var(--ink);
+  }
+  .usage:first-child{border-top:none;padding-top:0}
+  .usage .ix{
+    font-family:var(--mono);
+    font-size:13px;color:var(--oxide);letter-spacing:.2em;
+  }
+  .usage h4{
+    font-family:var(--display);
+    font-weight:400;font-style:italic;
+    font-size:30px;line-height:1.1;
+    margin:0 0 10px;
+  }
+  .usage p{font-size:16px;color:var(--ink-mute);margin:0;max-width:36ch;line-height:1.55}
+  .usage .specimen{align-self:start}
+
+  /* ---------- §03 MERITS ---------- */
+  .merits{
+    columns:2;
+    column-gap:64px;
+    column-rule:1px solid var(--rule);
+  }
+  .merit{
+    break-inside:avoid;
+    padding:18px 0;
+    border-bottom:1px solid var(--rule);
+    display:grid;
+    grid-template-columns:auto 1fr;
+    gap:18px;
+  }
+  .merit .mk{
+    font-family:var(--display);
+    font-style:italic;
+    font-size:22px;
+    color:var(--oxide);
+    line-height:1;
+    width:32px;
+  }
+  .merit h5{
+    font-family:var(--display);font-weight:400;
+    font-size:20px;line-height:1.15;margin:0 0 4px;
+    letter-spacing:-.005em;
+  }
+  .merit p{
+    font-size:14.5px;line-height:1.5;margin:0;color:var(--ink-mute);
+  }
+
+  /* ---------- §04 PROVISIONS (options) ---------- */
+  .options{
+    border:1px solid var(--ink);
+    background:rgba(255,255,255,.3);
+    padding:0;
+  }
+  .options table{
+    width:100%;
+    border-collapse:collapse;
+    font-family:var(--mono);
+    font-size:13px;
+  }
+  .options th,.options td{
+    text-align:left;
+    padding:14px 22px;
+    border-bottom:1px solid var(--rule);
+    vertical-align:top;
+  }
+  .options thead th{
+    font-size:10.5px;letter-spacing:.24em;text-transform:uppercase;color:var(--ink-mute);
+    border-bottom:1px solid var(--ink);
+    background:var(--paper-deep);
+  }
+  .options tbody tr:last-child td{border-bottom:none}
+  .options tbody tr:hover{background:rgba(160,59,31,.06)}
+  .options td.flag{color:var(--oxide);white-space:nowrap}
+  .options td.desc{font-family:var(--serif);font-size:15px;color:var(--ink);line-height:1.45}
+  .options td.def{color:var(--slate);white-space:nowrap}
+
+  /* ---------- COLOPHON ---------- */
+  .colophon{
+    padding:clamp(56px,8vw,96px) 0 48px;
+  }
+  .col-grid{
+    display:grid;
+    grid-template-columns:1.6fr 1fr 1fr;
+    gap:48px;
+    align-items:start;
+  }
+  .col-grid h6{
+    font-family:var(--mono);font-size:10.5px;letter-spacing:.24em;text-transform:uppercase;
+    color:var(--ink-mute);margin:0 0 14px;
+    border-top:1px solid var(--ink);padding-top:10px;
+  }
+  .col-grid p,.col-grid ul{font-size:15px;line-height:1.55;color:var(--ink);margin:0}
+  .col-grid ul{list-style:none;padding:0}
+  .col-grid li{padding:4px 0}
+  .signoff{
+    font-family:var(--display);font-style:italic;font-size:22px;line-height:1.35;color:var(--ink);
+    max-width:34ch;
+  }
+  .signoff small{display:block;font-family:var(--mono);font-style:normal;font-size:10.5px;letter-spacing:.24em;text-transform:uppercase;color:var(--ink-mute);margin-top:14px}
+
+  .footrule{
+    display:flex;align-items:center;justify-content:center;
+    gap:18px;
+    padding:32px 0;
+    font-family:var(--mono);font-size:10.5px;letter-spacing:.28em;text-transform:uppercase;color:var(--ink-mute);
+    border-top:1px solid var(--ink);
+  }
+  .footrule .dia{font-family:var(--display);color:var(--oxide);font-size:14px}
+
+  /* ---------- DIVIDERS ---------- */
+  .diadiv{
+    display:flex;align-items:center;justify-content:center;gap:18px;
+    padding:0 0 8px;
+    font-family:var(--display);font-style:italic;color:var(--oxide);font-size:18px;
+  }
+  .diadiv::before,.diadiv::after{content:"";flex:1;height:1px;background:var(--ink)}
+
+  /* ---------- REVEAL ---------- */
+  .reveal{opacity:0;transform:translateY(14px);animation:rise .9s cubic-bezier(.2,.7,.2,1) forwards}
+  .d1{animation-delay:.05s}.d2{animation-delay:.15s}.d3{animation-delay:.28s}.d4{animation-delay:.42s}.d5{animation-delay:.58s}.d6{animation-delay:.74s}
+  @keyframes rise{to{opacity:1;transform:none}}
+  @media (prefers-reduced-motion: reduce){
+    .reveal{opacity:1;transform:none;animation:none}
+    a,.card,.btn{transition:none}
+  }
+
+  /* ---------- RESPONSIVE ---------- */
+  @media (max-width: 920px){
+    .masthead{grid-template-columns:1fr;text-align:left;gap:8px}
+    .masthead .right{text-align:left}
+    .masthead .center{text-align:left}
+    .hero-grid{grid-template-columns:1fr;gap:40px}
+    .install-grid{grid-template-columns:1fr}
+    .usage{grid-template-columns:auto 1fr;gap:18px}
+    .usage .specimen{grid-column:1 / -1}
+    .merits{columns:1}
+    .gutter-grid{grid-template-columns:1fr;gap:18px}
+    .marginalia{border-top:none;padding-top:0}
+    .col-grid{grid-template-columns:1fr;gap:28px}
+    .sec-head{grid-template-columns:1fr;gap:14px;align-items:start}
+    .options th,.options td{padding:12px 14px}
+    .options td.desc{font-size:14px}
+  }
+</style>
+</head>
+<body>
+
+  <!-- ============== MASTHEAD ============== -->
+  <header class="wrap">
+    <div class="masthead reveal d1">
+      <div class="left">Vol. I &nbsp;·&nbsp; №01 &nbsp;·&nbsp; MMXXVI</div>
+      <div class="center"><em>goscrape</em><span>The Quarterly of Web Preservation</span></div>
+      <div class="right">Filed under <em style="font-family:var(--serif);font-style:italic;text-transform:none;letter-spacing:0">/tools/archival</em></div>
+    </div>
+    <div class="submast reveal d2">
+      <div class="crest"><span class="glyph">g</span> a console instrument · MIT licensed</div>
+      <div>est. 2017 &nbsp;◆&nbsp; written in Go</div>
+    </div>
+  </header>
+
+  <!-- ============== HERO ============== -->
+  <main>
+  <section class="wrap hero">
+    <div class="eyebrow reveal d2">A field report</div>
+    <h1 class="headline reveal d3">
+      An instrument<br/>
+      for the <em>preservation</em><br/>
+      of the web.
+      <span class="small">A small, console utility — written in Go — that walks a website, fetches what is necessary, and lays it down on disk for later, quieter reading.</span>
+    </h1>
+
+    <div class="hero-grid">
+      <div class="lede reveal d4">
+        The open web is not eternal. Pages disappear behind logins, redirects, paywalls, and quiet sunsets. <em>goscrape</em> is the workshop tool one keeps within arm's reach — a single binary that copies a site, rewrites its links to point inward, and serves it back from <code style="font-family:var(--mono);font-size:.85em;color:var(--oxide)">localhost:8080</code> as if nothing had changed.
+        <div class="cta">
+          <a class="btn" href="https://github.com/cornelk/goscrape">Read on GitHub →</a>
+          <a class="btn ghost" href="#install">Install instructions</a>
+        </div>
+      </div>
+
+      <div class="specimen reveal d5" aria-hidden="false">
+        <span class="specimen-label">Specimen 01 — session</span>
+<span class="prompt">$</span> goscrape https<span class="flag">://</span>cornelk.com<br/>
+<span class="out">› fetching index ……………… 1 page</span><br/>
+<span class="out">› indexing links ………………… 47</span><br/>
+<span class="out">› downloading assets ……… 122 / 122</span><br/>
+<span class="out">› rewriting refs ……………… ok</span><br/>
+<span class="prompt">$</span> goscrape <span class="flag">--serve</span> cornelk.com<br/>
+<span class="out">› listening on :8080  ▸  open to read</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============== §01 INSTALL ============== -->
+  <section class="wrap section" id="install">
+    <div class="sec-head reveal d1">
+      <div class="sec-no">§01 — Installation</div>
+      <h2 class="sec-title">Two paths<br/><em>to the binary.</em></h2>
+    </div>
+
+    <div class="gutter-grid">
+      <aside class="marginalia">
+        <b>Note.</b><br/>
+        Either route yields the same artifact: a single, statically-linked executable. No daemons. No agents. No telemetry.
+      </aside>
+
+      <div class="install-grid">
+        <article class="card">
+          <div class="num">i.</div>
+          <h3>From source, via <em>go install</em></h3>
+          <p>If a recent Go toolchain is at hand. The binary lands in <code style="font-family:var(--mono);font-size:.9em">$GOBIN</code>, which is usually <code style="font-family:var(--mono);font-size:.9em">~/go/bin</code>.</p>
+          <div class="specimen"><span class="specimen-label">Specimen 02</span>
+<span class="prompt">$</span> go install github.com<span class="flag">/</span>cornelk<span class="flag">/</span>goscrape@latest</div>
+        </article>
+
+        <article class="card">
+          <div class="num">ii.</div>
+          <h3>From a <em>release</em></h3>
+          <p>Pre-built binaries for macOS, Linux, and Windows are shipped with each tagged release. Unpack and place anywhere on <code style="font-family:var(--mono);font-size:.9em">$PATH</code>.</p>
+          <div class="specimen"><span class="specimen-label">Specimen 03</span>
+<span class="prompt">$</span> curl <span class="flag">-L</span> .../goscrape_darwin_arm64.tar.gz <span class="flag">|</span> tar xz<br/>
+<span class="prompt">$</span> mv goscrape <span class="flag">/usr/local/bin/</span></div>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============== §02 USAGE ============== -->
+  <section class="wrap section">
+    <div class="sec-head reveal d1">
+      <div class="sec-no">§02 — Usage</div>
+      <h2 class="sec-title">A small grammar,<br/><em>plainly stated.</em></h2>
+    </div>
+
+    <div class="gutter-grid">
+      <aside class="marginalia">
+        <b>Caveat lector.</b><br/>
+        Defaults are deliberately conservative — depth 10, no external assets, polite request pacing.
+      </aside>
+
+      <div class="usage-list">
+        <article class="usage">
+          <div class="ix">i.</div>
+          <div>
+            <h4>Mirror a site.</h4>
+            <p>Walks links breadth-first from the root, fetches every asset it touches, and writes a browsable directory to disk.</p>
+          </div>
+          <div class="specimen"><span class="specimen-label">command</span>
+<span class="prompt">$</span> goscrape https<span class="flag">://</span>example.com</div>
+        </article>
+
+        <article class="usage">
+          <div class="ix">ii.</div>
+          <div>
+            <h4>Read it back, offline.</h4>
+            <p>Spins up a tiny static webserver against the downloaded directory — the archive behaves like the original.</p>
+          </div>
+          <div class="specimen"><span class="specimen-label">command</span>
+<span class="prompt">$</span> goscrape <span class="flag">--serve</span> example.com</div>
+        </article>
+
+        <article class="usage">
+          <div class="ix">iii.</div>
+          <div>
+            <h4>Narrow the field.</h4>
+            <p>PERL-compatible regular expressions decide what is fetched and what is left where it is.</p>
+          </div>
+          <div class="specimen"><span class="specimen-label">command</span>
+<span class="prompt">$</span> goscrape \<br/>
+&nbsp;&nbsp;<span class="flag">--include</span> "/docs/"  \<br/>
+&nbsp;&nbsp;<span class="flag">--exclude</span> "\\.pdf$" \<br/>
+&nbsp;&nbsp;https<span class="flag">://</span>example.com</div>
+        </article>
+
+        <article class="usage">
+          <div class="ix">iv.</div>
+          <div>
+            <h4>Save the bytes.</h4>
+            <p>Re-encode JPEG and PNG assets at a lower quality on the way down — the archive ends up dramatically lighter on disk.</p>
+          </div>
+          <div class="specimen"><span class="specimen-label">command</span>
+<span class="prompt">$</span> goscrape <span class="flag">--imagequality</span> 70 \<br/>
+&nbsp;&nbsp;https<span class="flag">://</span>example.com</div>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============== §03 MERITS ============== -->
+  <section class="wrap section">
+    <div class="sec-head reveal d1">
+      <div class="sec-no">§03 — On its merits</div>
+      <h2 class="sec-title">Why a new<br/><em>scraper, exactly?</em></h2>
+    </div>
+
+    <div class="diadiv">◆ &nbsp; with apologies to wget, httrack, &amp; Teleport Pro &nbsp; ◆</div>
+
+    <div class="merits">
+      <div class="merit">
+        <div class="mk">a.</div>
+        <div>
+          <h5>Exclusions are honored.</h5>
+          <p>Unlike <em>wget</em>, the URLs you tell it to skip are not silently fetched anyway.</p>
+        </div>
+      </div>
+      <div class="merit">
+        <div class="mk">b.</div>
+        <div>
+          <h5>No partial wreckage on disk.</h5>
+          <p>Interrupt a run and the work-in-progress files do not linger as half-formed husks.</p>
+        </div>
+      </div>
+      <div class="merit">
+        <div class="mk">c.</div>
+        <div>
+          <h5>Resumable by default.</h5>
+          <p>Assets already downloaded are quietly skipped on the next pass.</p>
+        </div>
+      </div>
+      <div class="merit">
+        <div class="mk">d.</div>
+        <div>
+          <h5>External assets, included.</h5>
+          <p>Stylesheets and images served from third-party domains come along.</p>
+        </div>
+      </div>
+      <div class="merit">
+        <div class="mk">e.</div>
+        <div>
+          <h5>Image weight, reduced.</h5>
+          <p>An optional re-encode pass on JPEG and PNG keeps archives tidy.</p>
+        </div>
+      </div>
+      <div class="merit">
+        <div class="mk">f.</div>
+        <div>
+          <h5>One binary, every platform.</h5>
+          <p>Anywhere Go runs, this runs. No daemons, no runtime, no surprises.</p>
+        </div>
+      </div>
+      <div class="merit">
+        <div class="mk">g.</div>
+        <div>
+          <h5>Polite by default.</h5>
+          <p>Sensible defaults — depth, headers, pacing — make the first run safe to try.</p>
+        </div>
+      </div>
+      <div class="merit">
+        <div class="mk">h.</div>
+        <div>
+          <h5>Free, and open.</h5>
+          <p>MIT-licensed. Read the source, file a fix, ship a fork.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============== §04 PROVISIONS ============== -->
+  <section class="wrap section">
+    <div class="sec-head reveal d1">
+      <div class="sec-no">§04 — Provisions</div>
+      <h2 class="sec-title">A glossary<br/><em>of flags.</em></h2>
+    </div>
+
+    <div class="gutter-grid">
+      <aside class="marginalia">
+        <b>Excerpted.</b><br/>
+        A representative selection — invoke <code style="font-family:var(--mono);font-size:.95em">goscrape --help</code> for the full register.
+      </aside>
+
+      <div class="options">
+        <table>
+          <thead><tr><th style="width:26%">Flag</th><th>Description</th><th style="width:18%">Default</th></tr></thead>
+          <tbody>
+            <tr><td class="flag">--include, -n</td><td class="desc">Restrict the walk to URLs matching a regular expression.</td><td class="def">—</td></tr>
+            <tr><td class="flag">--exclude, -x</td><td class="desc">Skip URLs matching a regular expression.</td><td class="def">—</td></tr>
+            <tr><td class="flag">--output, -o</td><td class="desc">Directory in which to lay the archive down.</td><td class="def">./</td></tr>
+            <tr><td class="flag">--depth, -d</td><td class="desc">Maximum link depth from the entry URL. Zero is unlimited.</td><td class="def">10</td></tr>
+            <tr><td class="flag">--imagequality, -i</td><td class="desc">Re-encode JPEG &amp; PNG assets at this quality. Zero disables it.</td><td class="def">0</td></tr>
+            <tr><td class="flag">--timeout, -t</td><td class="desc">Per-request time limit, in seconds.</td><td class="def">—</td></tr>
+            <tr><td class="flag">--serve, -s</td><td class="desc">Serve a previously downloaded site over HTTP.</td><td class="def">—</td></tr>
+            <tr><td class="flag">--serverport, -r</td><td class="desc">Port for the local webserver under <em style="font-family:var(--serif);font-style:italic">--serve</em>.</td><td class="def">8080</td></tr>
+            <tr><td class="flag">--cookiefile, -c</td><td class="desc">Path to a JSON file of cookies to present.</td><td class="def">—</td></tr>
+            <tr><td class="flag">--header, -h</td><td class="desc">An extra HTTP header to send with every request.</td><td class="def">—</td></tr>
+            <tr><td class="flag">--proxy, -p</td><td class="desc">An HTTP, HTTPS, or SOCKS5 proxy URL.</td><td class="def">—</td></tr>
+            <tr><td class="flag">--user, -u</td><td class="desc">Credentials for HTTP basic authentication.</td><td class="def">—</td></tr>
+            <tr><td class="flag">--useragent, -a</td><td class="desc">Override the default User-Agent string.</td><td class="def">—</td></tr>
+            <tr><td class="flag">--include-external, -e</td><td class="desc">Also fetch assets from third-party domains.</td><td class="def">off</td></tr>
+            <tr><td class="flag">--verbose, -v</td><td class="desc">Narrate every step.</td><td class="def">off</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============== COLOPHON ============== -->
+  <section class="wrap colophon">
+    <div class="col-grid">
+      <div class="signoff">
+        “Software, like buildings, is a record of choices. <em>goscrape</em> chooses to be small, honest, and easily read.”
+        <small>— colophon</small>
+      </div>
+
+      <div>
+        <h6>Repository</h6>
+        <ul>
+          <li><a href="https://github.com/cornelk/goscrape">cornelk/goscrape</a></li>
+          <li><a href="https://github.com/cornelk/goscrape/releases">Tagged releases</a></li>
+          <li><a href="https://pkg.go.dev/github.com/cornelk/goscrape">pkg.go.dev</a></li>
+        </ul>
+      </div>
+
+      <div>
+        <h6>Specimens</h6>
+        <ul>
+          <li>Set in Instrument Serif &amp; Fraunces.</li>
+          <li>Code set in JetBrains Mono.</li>
+          <li>Printed in two inks: oxide red &amp; slate.</li>
+          <li>Pressed onto a paper of cream &amp; grain.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+  </main>
+
+  <div class="footrule">
+    <span>End of file</span>
+    <span class="dia">◆ ◆ ◆</span>
+    <span>© the contributors · MIT</span>
+  </div>
+
+</body>
+</html>
