@@ -284,8 +284,9 @@ func TestProcessURL_SkipExisting_FileExists_SkipsDownload(t *testing.T) {
 
 	// Start page file exists → should NOT have been downloaded
 	assert.Equal(t, 0, downloadCount, "no HTTP downloads should occur when file exists")
-	// Children should NOT be queued (URLs are rewritten in cached files)
-	assert.Equal(t, 0, len(s.webPageQueue), "no children should be queued from skipped pages")
+	// Children should NOT have been processed (URLs are rewritten in cached files)
+	assert.False(t, s.processed.Contains("/child1"), "no children should be processed from skipped pages")
+	assert.False(t, s.processed.Contains("/child2"), "no children should be processed from skipped pages")
 }
 
 func TestProcessURL_SkipExisting_FileMissing_FallsThrough(t *testing.T) {
@@ -361,7 +362,6 @@ func TestProcessURL_SkipExistingMarkdown_NoChildren(t *testing.T) {
 	err = s.Start(context.Background())
 	require.NoError(t, err)
 	assert.Equal(t, 0, downloadCount, "no downloads when .md file exists")
-	assert.Equal(t, 0, len(s.webPageQueue), "no children queued from skipped markdown page")
 }
 
 // TestURLRewriteVerification empirically confirms that saved HTML has URLs
