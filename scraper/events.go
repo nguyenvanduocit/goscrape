@@ -62,14 +62,14 @@ func (s *Scraper) emit(ev Event) {
 	s.config.OnEvent(ev)
 }
 
-// emitQueueChanged emits a queue-size update using current queue state.
-// Caller must hold no locks (this acquires webPageMu).
+// emitQueueChanged emits a queue-size update using the pending page counter.
 func (s *Scraper) emitQueueChanged() {
 	if s.config.OnEvent == nil {
 		return
 	}
-	s.webPageMu.Lock()
-	size := len(s.webPageQueueDepth)
-	s.webPageMu.Unlock()
+	size := int(s.queue.pendingPages.Load())
+	if size < 0 {
+		size = 0
+	}
 	s.emit(Event{Kind: EventQueueChanged, QueueSize: size})
 }

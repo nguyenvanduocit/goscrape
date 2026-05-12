@@ -2,14 +2,13 @@ package scraper
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strings"
-	"sync"
 
 	"github.com/cornelk/goscrape/css"
 	"github.com/cornelk/goscrape/htmlindex"
@@ -21,12 +20,6 @@ import (
 // a downloaded file content before it will be stored on disk.
 type assetProcessor func(URL *url.URL, data []byte) []byte
 
-// downloadTask represents a single asset to download.
-type downloadTask struct {
-	url       *url.URL
-	processor assetProcessor
-}
-
 var tagsWithReferences = []string{
 	htmlindex.LinkTag,
 	htmlindex.ScriptTag,
@@ -34,27 +27,27 @@ var tagsWithReferences = []string{
 	htmlindex.InlineStyleTag,
 }
 
-func (s *Scraper) downloadReferences(ctx context.Context, index *htmlindex.Index) error {
+// submitReferences collects all asset URLs from the parsed HTML index and
+// submits them to the unified task queue. Workers process them concurrently
+// alongside page tasks — there is no per-page wait.
+func (s *Scraper) submitReferences(index *htmlindex.Index) {
 	// Collect body background images
 	references, err := index.URLs(htmlindex.BodyTag)
 	if err != nil {
 		s.logger.Error("Getting body node URLs failed", log.Err(err))
 	}
-	s.assetsMu.Lock()
-	s.assetQueue = append(s.assetQueue, references...)
-	s.assetsMu.Unlock()
+	for _, u := range references {
+		s.submitAsset(u, s.checkImageForRecode)
+	}
 
 	// Collect img tags
 	references, err = index.URLs(htmlindex.ImgTag)
 	if err != nil {
 		s.logger.Error("Getting img node URLs failed", log.Err(err))
 	}
-	s.assetsMu.Lock()
-	s.assetQueue = append(s.assetQueue, references...)
-	s.assetsMu.Unlock()
-
-	// Collect all tasks
-	var tasks []downloadTask //nolint:prealloc
+	for _, u := range references {
+		s.submitAsset(u, s.checkImageForRecode)
+	}
 
 	// Skip CSS/JS downloads in markdown mode — only images/fonts/media are needed.
 	if !s.config.Markdown {
@@ -74,131 +67,34 @@ func (s *Scraper) downloadReferences(ctx context.Context, index *htmlindex.Index
 				processor = s.jsProcessor
 			}
 			for _, ur := range references {
-				tasks = append(tasks, downloadTask{url: ur, processor: processor})
+				s.submitAsset(ur, processor)
 			}
-		}
-	}
-
-	// Add image tasks (snapshot under lock to avoid race with concurrent processors)
-	s.assetsMu.Lock()
-	pending := s.assetQueue
-	s.assetQueue = nil
-	s.assetsMu.Unlock()
-
-	for _, image := range pending {
-		tasks = append(tasks, downloadTask{url: image, processor: s.checkImageForRecode})
-	}
-
-	// Process tasks
-	if err := s.processTasks(ctx, tasks); err != nil {
-		return err
-	}
-
-	// Process any newly discovered assets from CSS/JS processing
-	return s.processDiscoveredAssets(ctx)
-}
-
-// processDiscoveredAssets processes assets discovered during CSS/JS processing.
-func (s *Scraper) processDiscoveredAssets(ctx context.Context) error {
-	for {
-		s.assetsMu.Lock()
-		if len(s.assetQueue) == 0 {
-			s.assetsMu.Unlock()
-			return nil
-		}
-		pending := s.assetQueue
-		s.assetQueue = nil
-		s.assetsMu.Unlock()
-
-		var tasks []downloadTask
-		for _, u := range pending {
-			var proc assetProcessor
-			if strings.ToLower(path.Ext(u.Path)) == ".css" {
-				proc = s.cssProcessor
-			} else {
-				proc = s.checkImageForRecode
-			}
-			tasks = append(tasks, downloadTask{url: u, processor: proc})
-		}
-		if err := s.processTasks(ctx, tasks); err != nil {
-			return err
 		}
 	}
 }
 
-// processTasks downloads assets either sequentially or concurrently based on config.
-func (s *Scraper) processTasks(ctx context.Context, tasks []downloadTask) error {
-	if len(tasks) == 0 {
-		return nil
+// submitAsset checks the URL for eligibility and submits it to the unified
+// task queue. Dedup happens here (before enqueue) so duplicate references
+// don't waste queue slots or worker dispatches.
+func (s *Scraper) submitAsset(u *url.URL, processor assetProcessor) {
+	u.Fragment = ""
+	if !s.shouldURLBeDownloaded(u, 0, true) {
+		return
 	}
-
-	// Sequential download if concurrency is 1
-	if s.config.Concurrency <= 1 {
-		for _, task := range tasks {
-			if err := s.downloadAsset(ctx, task.url, task.processor); err != nil {
-				if errors.Is(err, context.Canceled) {
-					return err
-				}
-			}
-		}
-		return nil
-	}
-
-	// Concurrent download with worker pool
-	var wg sync.WaitGroup
-	taskChan := make(chan downloadTask, s.config.Concurrency)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	var cancelErr error
-	var cancelOnce sync.Once
-
-	// Start workers
-	for range s.config.Concurrency {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for task := range taskChan {
-				if err := s.downloadAsset(ctx, task.url, task.processor); err != nil {
-					if errors.Is(err, context.Canceled) {
-						cancelOnce.Do(func() {
-							cancelErr = err
-							cancel()
-						})
-						return
-					}
-				}
-			}
-		}()
-	}
-
-	// Send tasks to workers
-sendLoop:
-	for _, task := range tasks {
-		select {
-		case <-ctx.Done():
-			break sendLoop
-		case taskChan <- task:
-		}
-	}
-	close(taskChan)
-
-	wg.Wait()
-
-	if cancelErr != nil {
-		return cancelErr
-	}
-	return nil
+	s.queue.submit(task{
+		kind:      taskAsset,
+		url:       u,
+		processor: processor,
+	})
 }
 
 // downloadAsset downloads an asset if it does not exist on disk yet.
+// Callers must pre-check eligibility via shouldURLBeDownloaded before
+// submitting to the queue — the check-and-mark happens at submit time
+// in submitAsset to avoid wasting queue slots on duplicates.
 func (s *Scraper) downloadAsset(ctx context.Context, u *url.URL, processor assetProcessor) error {
 	u.Fragment = ""
 	urlFull := u.String()
-
-	if !s.shouldURLBeDownloaded(u, 0, true) {
-		return nil
-	}
 
 	filePath := s.getFilePath(u, false)
 	if s.fileExists(filePath) {
@@ -209,6 +105,41 @@ func (s *Scraper) downloadAsset(ctx context.Context, u *url.URL, processor asset
 
 	s.logger.Info("Downloading asset", log.String("url", urlFull))
 	s.emit(Event{Kind: EventAssetStart, URL: urlFull})
+
+	// When no processor is needed, stream directly to disk to avoid holding
+	// the entire response body in memory. This keeps memory bounded regardless
+	// of asset size (videos, large PDFs, etc.).
+	if processor == nil {
+		if err := s.dirCreator(filepath.Dir(filePath)); err != nil {
+			s.logger.Error("Creating asset directory failed",
+				log.String("url", urlFull),
+				log.String("dir", filepath.Dir(filePath)),
+				log.Err(err))
+			s.addFailedURL(urlFull, err)
+			s.emit(Event{Kind: EventFailed, URL: urlFull, Err: err.Error()})
+			return fmt.Errorf("creating asset directory: %w", err)
+		}
+		_, err := s.httpStreamer(ctx, u, filePath)
+		if err != nil {
+			if s.config.Skip403 && IsHTTPStatusError(err, http.StatusForbidden) {
+				s.incrementProgress()
+				s.emit(Event{Kind: EventSkipped, URL: urlFull, Message: "asset 403, skipped"})
+				return nil
+			}
+			s.unmarkURLProcessed(u)
+			s.logger.Error("Downloading asset failed",
+				log.String("url", urlFull),
+				log.Err(err))
+			s.addFailedURL(urlFull, err)
+			s.emit(Event{Kind: EventFailed, URL: urlFull, Err: err.Error()})
+			return fmt.Errorf("downloading asset: %w", err)
+		}
+		s.incrementProgress()
+		s.emit(Event{Kind: EventAssetDone, URL: urlFull})
+		return nil
+	}
+
+	// Processor needed — buffer the response so the processor can transform it.
 	data, _, err := s.httpDownloader(ctx, u)
 	if err != nil {
 		// Skip silently if configured and error is 403 Forbidden
@@ -228,9 +159,7 @@ func (s *Scraper) downloadAsset(ctx context.Context, u *url.URL, processor asset
 		return fmt.Errorf("downloading asset: %w", err)
 	}
 
-	if processor != nil {
-		data = processor(u, data)
-	}
+	data = processor(u, data)
 
 	if err = s.fileWriter(filePath, data); err != nil {
 		s.logger.Error("Writing asset file failed",
@@ -472,12 +401,18 @@ func (s *Scraper) jsProcessor(baseURL *url.URL, data []byte) []byte {
 	return []byte(jsData)
 }
 
-// enqueueAssets adds discovered asset URLs to the download queue (thread-safe).
+// enqueueAssets submits discovered asset URLs to the unified task queue.
+// Called from cssProcessor/jsProcessor when they discover new URLs in
+// CSS/JS content. Each URL gets an appropriate processor based on its
+// file extension.
 func (s *Scraper) enqueueAssets(urls []*url.URL) {
-	if len(urls) == 0 {
-		return
+	for _, u := range urls {
+		var proc assetProcessor
+		if strings.ToLower(path.Ext(u.Path)) == ".css" {
+			proc = s.cssProcessor
+		} else {
+			proc = s.checkImageForRecode
+		}
+		s.submitAsset(u, proc)
 	}
-	s.assetsMu.Lock()
-	s.assetQueue = append(s.assetQueue, urls...)
-	s.assetsMu.Unlock()
 }

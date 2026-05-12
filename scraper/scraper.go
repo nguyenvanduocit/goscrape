@@ -91,6 +91,7 @@ type Config struct {
 
 type (
 	httpDownloader     func(ctx context.Context, u *url.URL) ([]byte, *url.URL, error)
+	httpStreamer        func(ctx context.Context, u *url.URL, filePath string) (*url.URL, error)
 	dirCreator         func(path string) error
 	fileExistenceCheck func(filePath string) bool
 	fileWriter         func(filePath string, data []byte) error
@@ -151,19 +152,18 @@ type Scraper struct {
 	processed   set.Set[string]
 	processedMu sync.Mutex // protects processed set during concurrent access
 
-	assetQueue       []*url.URL
-	assetsMu          sync.Mutex // protects assetQueue during concurrent access
-	webPageQueue      []*url.URL
-	webPageQueueDepth map[string]uint
-	webPageMu         sync.Mutex // protects webPageQueue and webPageQueueDepth
+	// queue is the unified work queue shared by all workers. Initialized
+	// in New() so processors called from tests don't panic on nil.
+	queue *taskQueue
 
 	dirCreator         dirCreator
 	fileExistenceCheck fileExistenceCheck
 	fileWriter         fileWriter
 	httpDownloader     httpDownloader
+	httpStreamer        httpStreamer
 
-	// Rate limiting
-	rateLimiter *rate.Limiter
+	// Rate limiting (per-host)
+	hostLimiter *hostLimiter
 
 	// Progress tracking
 	progress *progressbar.ProgressBar
@@ -220,18 +220,43 @@ func New(logger *log.Logger, cfg Config) (*Scraper, error) {
 		return nil, fmt.Errorf("creating proxy transport: %w", err)
 	}
 
+	// Set default concurrency early so transport tuning can reference it.
+	concurrency := cfg.Concurrency
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+
+	// Tune transport for connection reuse under concurrent load.
+	// Override DisableKeepAlives (set to true by gotokit SOCKS5 transport) to allow reuse.
+	transport.DisableKeepAlives = false
+	transport.MaxIdleConns = max(100, concurrency*4)
+	transport.MaxIdleConnsPerHost = max(concurrency*2, 16)
+	transport.MaxConnsPerHost = concurrency * 2
+	transport.IdleConnTimeout = 60 * time.Second
+	transport.ForceAttemptHTTP2 = true
+	transport.WriteBufferSize = 32 << 10
+	transport.ReadBufferSize = 32 << 10
+
+	// Capture the existing DialContext (set by SOCKS5 proxy) before wrapping it.
+	// If nil, default to a plain net.Dialer so SOCKS5 routing is preserved.
+	prevDial := transport.DialContext
+	if prevDial == nil {
+		d := &net.Dialer{Timeout: 30 * time.Second}
+		prevDial = d.DialContext
+	}
+
 	// Wrap dialer to block requests to private/loopback addresses (SSRF protection).
 	// The main scrape target host is always user-provided and trusted.
 	targetHost := u.Hostname()
-	originalDialer := &net.Dialer{Timeout: 30 * time.Second}
 	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
 		if err != nil {
 			return nil, fmt.Errorf("splitting host:port: %w", err)
 		}
-		// Allow connections to the main scrape target (or skip check if no target configured)
+		// Allow connections to the main scrape target (or skip check if no target configured).
+		// Use prevDial so SOCKS5 routes target traffic correctly.
 		if targetHost == "" || host == targetHost {
-			return originalDialer.DialContext(ctx, network, net.JoinHostPort(host, port))
+			return prevDial(ctx, network, net.JoinHostPort(host, port))
 		}
 		ips, err := net.DefaultResolver.LookupHost(ctx, host)
 		if err != nil {
@@ -249,8 +274,9 @@ func New(logger *log.Logger, cfg Config) (*Scraper, error) {
 				return nil, fmt.Errorf("blocked request to private/internal address: %s (%s)", host, ipStr)
 			}
 		}
-		// Dial the verified IP directly to prevent DNS rebinding attacks
-		return originalDialer.DialContext(ctx, network, net.JoinHostPort(ips[0], port))
+		// Dial the verified IP directly to prevent DNS rebinding attacks.
+		// Use prevDial so SOCKS5 routing is preserved for non-target hosts.
+		return prevDial(ctx, network, net.JoinHostPort(ips[0], port))
 	}
 
 	client := &http.Client{
@@ -272,26 +298,32 @@ func New(logger *log.Logger, cfg Config) (*Scraper, error) {
 
 		processed: set.New[string](),
 
-		webPageQueueDepth: map[string]uint{},
-		allowedCDN:        set.NewFromSlice(cfg.AllowCDN),
+		// Initialize the unified task queue with a generous buffer so
+		// most submits complete without spawning a goroutine. The queue
+		// is created here (not in Start) so processors called from unit
+		// tests don't panic on nil.
+		queue: newTaskQueue(concurrency * 64),
+
+		allowedCDN: set.NewFromSlice(cfg.AllowCDN),
 	}
 
 	s.dirCreator = s.createDownloadPath
 	s.fileExistenceCheck = s.fileExists
 	s.fileWriter = s.writeFile
 	s.httpDownloader = s.downloadURLWithRetries
+	s.httpStreamer = s.downloadURLStreaming
 
 	if s.config.Username != "" {
 		s.auth = "Basic " + base64.StdEncoding.EncodeToString([]byte(s.config.Username+":"+s.config.Password))
 	}
 
-	// Initialize rate limiter if configured
+	// Initialize per-host rate limiter if configured
 	if cfg.RateLimit > 0 {
 		burst := cfg.Concurrency
 		if burst < 1 {
 			burst = 1
 		}
-		s.rateLimiter = rate.NewLimiter(rate.Limit(cfg.RateLimit), burst)
+		s.hostLimiter = newHostLimiter(rate.Limit(cfg.RateLimit), burst)
 	}
 
 	// Set default concurrency
@@ -336,29 +368,42 @@ func (s *Scraper) Start(ctx context.Context) error {
 	// consumers can render it before its download begins.
 	s.emit(Event{Kind: EventPageDiscovered, URL: s.URL.String(), Parent: "", Depth: 0})
 
+	// Process the start page synchronously so that redirect handling
+	// (s.URL rewrite) completes before any workers read s.URL for host
+	// comparisons in shouldURLBeDownloaded.
 	if err := s.processURL(ctx, s.URL, 0); err != nil {
 		return err
 	}
 
-	head := 0
-	for {
-		s.webPageMu.Lock()
-		if head >= len(s.webPageQueue) {
-			s.webPageMu.Unlock()
-			break
-		}
-		ur := s.webPageQueue[head]
-		s.webPageQueue[head] = nil // release reference to allow GC
-		urlStr := ur.String()
-		currentDepth := s.webPageQueueDepth[urlStr]
-		delete(s.webPageQueueDepth, urlStr)
-		head++
-		s.webPageMu.Unlock()
-
-		if err := s.processURL(ctx, ur, currentDepth+1); err != nil && errors.Is(err, context.Canceled) {
-			return err
-		}
+	// Spawn workers to drain remaining tasks (child pages + assets submitted
+	// by the start page's processURL). closeWhenDone returns immediately if
+	// the start page submitted nothing.
+	var workerWg sync.WaitGroup
+	for range s.config.Concurrency {
+		workerWg.Add(1)
+		go func() {
+			defer workerWg.Done()
+			for t := range s.queue.ch {
+				// On cancellation, skip work but ALWAYS drain and
+				// call wg.Done — otherwise closeWhenDone hangs.
+				if ctx.Err() == nil {
+					s.processTask(ctx, t)
+				}
+				if t.kind == taskPage {
+					s.queue.pendingPages.Add(-1)
+					s.emitQueueChanged()
+				}
+				s.queue.wg.Done()
+			}
+		}()
 	}
+
+	// Closer goroutine: waits for all outstanding tasks to complete,
+	// then closes the channel so workers exit their range loops.
+	go s.queue.closeWhenDone()
+
+	// Block until all workers exit.
+	workerWg.Wait()
 
 	// Finish progress bar
 	if s.progress != nil {
@@ -366,6 +411,26 @@ func (s *Scraper) Start(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// processTask dispatches a task to the appropriate handler based on its kind.
+func (s *Scraper) processTask(ctx context.Context, t task) {
+	switch t.kind {
+	case taskPage:
+		if err := s.processURL(ctx, t.url, t.depth); err != nil {
+			if !errors.Is(err, context.Canceled) {
+				s.logger.Error("Processing page failed",
+					log.String("url", t.url.String()),
+					log.Err(err))
+			}
+		}
+	case taskAsset:
+		if err := s.downloadAsset(ctx, t.url, t.processor); err != nil {
+			if !errors.Is(err, context.Canceled) {
+				// Error already logged inside downloadAsset
+			}
+		}
+	}
 }
 
 func (s *Scraper) processURL(ctx context.Context, u *url.URL, currentDepth uint) error {
@@ -451,9 +516,7 @@ func (s *Scraper) processURL(ctx context.Context, u *url.URL, currentDepth uint)
 
 	s.storeDownload(u, data, doc, index, fileExtension)
 
-	if err := s.downloadReferences(ctx, index); err != nil {
-		return err
-	}
+	s.submitReferences(index)
 
 	// check first and download afterward to not hit max depth limit for
 	// start page links because of recursive linking
@@ -468,13 +531,15 @@ func (s *Scraper) processURL(ctx context.Context, u *url.URL, currentDepth uint)
 		ur.Fragment = ""
 
 		if s.shouldURLBeDownloaded(ur, currentDepth, false) {
-			s.webPageMu.Lock()
-			s.webPageQueue = append(s.webPageQueue, ur)
-			s.webPageQueueDepth[ur.String()] = currentDepth
-			s.webPageMu.Unlock()
+			s.queue.submit(task{
+				kind:   taskPage,
+				url:    ur,
+				depth:  currentDepth + 1,
+				parent: u.String(),
+			})
 			queued = true
 			// Record the discovery edge so the TUI can render the
-			// crawl as a tree. Depth is parent+1 (matches dequeue logic).
+			// crawl as a tree.
 			s.emit(Event{
 				Kind:   EventPageDiscovered,
 				URL:    ur.String(),

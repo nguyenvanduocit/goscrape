@@ -54,9 +54,10 @@ type arguments struct {
 	AllowCDN        []string `arg:"--allow-cdn,separate" help:"allow external assets from specific CDN domains (e.g., cdn.example.com)"`
 
 	// Concurrency and rate limiting
-	Concurrency int     `arg:"-j,--concurrency" help:"number of concurrent asset downloads" default:"4"`
-	RateLimit   float64 `arg:"--rate-limit" help:"max requests per second, 0 for unlimited" default:"0"`
-	Delay       int64   `arg:"--delay" help:"milliseconds delay between requests" default:"0"`
+	Concurrency int     `arg:"-j,--concurrency" help:"number of concurrent asset downloads (0 = use profile)" default:"0"`
+	RateLimit   float64 `arg:"--rate-limit" help:"max requests per second, 0 = use profile or unlimited" default:"0"`
+	Delay       int64   `arg:"--delay" help:"milliseconds delay between requests (0 = use profile)" default:"0"`
+	Profile     string  `arg:"--profile" help:"preset: polite (2/1rps/250ms), balanced (6/4rps/0ms), aggressive (16/0/0ms)" default:"polite"`
 
 	// Progress and logging
 	NoProgress   bool   `arg:"--no-progress" help:"disable progress bar"`
@@ -163,10 +164,40 @@ func readArguments() (arguments, error) {
 	return args, nil
 }
 
+// applyProfile fills in zero-valued concurrency/rate/delay fields from the named profile.
+// Fields explicitly set by the user (non-zero) are left unchanged.
+func applyProfile(args *arguments) {
+	type profileValues struct {
+		concurrency int
+		rateLimit   float64
+		delay       int64
+	}
+	profiles := map[string]profileValues{
+		"polite":     {concurrency: 2, rateLimit: 1.0, delay: 250},
+		"balanced":   {concurrency: 6, rateLimit: 4.0, delay: 0},
+		"aggressive": {concurrency: 16, rateLimit: 0, delay: 0},
+	}
+	p, ok := profiles[strings.ToLower(args.Profile)]
+	if !ok {
+		return // unknown profile, leave values as-is
+	}
+	if args.Concurrency == 0 {
+		args.Concurrency = p.concurrency
+	}
+	if args.RateLimit == 0 {
+		args.RateLimit = p.rateLimit
+	}
+	if args.Delay == 0 {
+		args.Delay = p.delay
+	}
+}
+
 func runScraper(ctx context.Context, args arguments, logger *log.Logger) error {
 	if len(args.URLs) == 0 {
 		return nil
 	}
+
+	applyProfile(&args)
 
 	var username, password string
 	if args.User != "" {
