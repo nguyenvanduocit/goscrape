@@ -2,6 +2,7 @@ package scraper
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"golang.org/x/net/publicsuffix"
@@ -41,5 +42,8 @@ func (h *hostLimiter) Wait(ctx context.Context, host string) error {
 		h.limiters[key] = lim
 	}
 	h.mu.Unlock()
-	return lim.Wait(ctx)
+	if err := lim.Wait(ctx); err != nil {
+		return fmt.Errorf("host rate limiter wait: %w", err)
+	}
+	return nil
 }

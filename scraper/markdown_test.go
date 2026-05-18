@@ -15,9 +15,11 @@ import (
 	"golang.org/x/net/html"
 )
 
+const testStartURL = "https://example.org/"
+
 func testURL(t *testing.T) *url.URL {
 	t.Helper()
-	u, err := url.Parse("https://example.org/")
+	u, err := url.Parse(testStartURL)
 	require.NoError(t, err)
 	return u
 }
@@ -25,7 +27,7 @@ func testURL(t *testing.T) *url.URL {
 func TestConvertToMarkdown(t *testing.T) {
 	logger := log.NewTestLogger(t)
 	cfg := Config{
-		URL:      "https://example.org/",
+		URL:      testStartURL,
 		Markdown: true,
 	}
 	s, err := New(logger, cfg)
@@ -49,7 +51,7 @@ func TestConvertToMarkdown(t *testing.T) {
 func TestConvertToMarkdownLinks(t *testing.T) {
 	logger := log.NewTestLogger(t)
 	cfg := Config{
-		URL:      "https://example.org/",
+		URL:      testStartURL,
 		Markdown: true,
 	}
 	s, err := New(logger, cfg)
@@ -69,7 +71,7 @@ func TestConvertToMarkdownLinks(t *testing.T) {
 func TestConvertToMarkdownImages(t *testing.T) {
 	logger := log.NewTestLogger(t)
 	cfg := Config{
-		URL:      "https://example.org/",
+		URL:      testStartURL,
 		Markdown: true,
 	}
 	s, err := New(logger, cfg)
@@ -90,7 +92,7 @@ func TestPageExtension(t *testing.T) {
 	logger := log.NewTestLogger(t)
 
 	// Default mode: .html
-	cfg := Config{URL: "https://example.org/"}
+	cfg := Config{URL: testStartURL}
 	s, err := New(logger, cfg)
 	require.NoError(t, err)
 	assert.Equal(t, PageExtension, s.pageExtension())
@@ -139,7 +141,7 @@ func TestGetPageFilePathWithExt(t *testing.T) {
 func TestMarkdownFilePathIntegration(t *testing.T) {
 	logger := log.NewTestLogger(t)
 	cfg := Config{
-		URL:      "https://example.org/",
+		URL:      testStartURL,
 		Markdown: true,
 	}
 	s, err := New(logger, cfg)
@@ -151,7 +153,7 @@ func TestMarkdownFilePathIntegration(t *testing.T) {
 	filePath := s.getFilePath(u, true)
 	assert.True(t, strings.HasSuffix(filePath, "about.md"), "expected .md suffix, got: %s", filePath)
 
-	u, err = url.Parse("https://example.org/")
+	u, err = url.Parse(testStartURL)
 	require.NoError(t, err)
 
 	filePath = s.getFilePath(u, true)
@@ -171,9 +173,9 @@ func TestMarkdownSkipsCSSJS(t *testing.T) {
 </html>
 `)
 
-	startURL := "https://example.org/"
+	startURL := testStartURL
 	urls := map[string][]byte{
-		"https://example.org/":          indexPage,
+		testStartURL:                    indexPage,
 		"https://example.org/style.css": []byte(`body{}`),
 		"https://example.org/app.js":    []byte(`console.log("hi")`),
 		"https://example.org/photo.jpg": []byte(`fake-jpg-data`),
@@ -237,7 +239,7 @@ func TestMarkdownSkipsCSSJS(t *testing.T) {
 func TestMarkdownStoreDownload(t *testing.T) {
 	logger := log.NewTestLogger(t)
 	cfg := Config{
-		URL:      "https://example.org/",
+		URL:      testStartURL,
 		Markdown: true,
 	}
 	s, err := New(logger, cfg)
@@ -388,7 +390,7 @@ func TestCleanupPreservesValidImageWithEmptyAlt(t *testing.T) {
 func TestConvertToMarkdownIncludesFrontmatter(t *testing.T) {
 	logger := log.NewTestLogger(t)
 	cfg := Config{
-		URL:      "https://example.org/",
+		URL:      testStartURL,
 		Markdown: true,
 	}
 	s, err := New(logger, cfg)

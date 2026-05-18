@@ -20,8 +20,9 @@ func sanitizeHostForPath(host string) string {
 	// Allowlist: only permit valid hostname characters
 	var b strings.Builder
 	for _, r := range host {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
-			(r >= '0' && r <= '9') || r == '-' || r == '.' {
+		isLetter := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
+		isDigit := r >= '0' && r <= '9'
+		if isLetter || isDigit || r == '-' || r == '.' {
 			b.WriteRune(r)
 		}
 	}

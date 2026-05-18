@@ -31,44 +31,40 @@ var tagsWithReferences = []string{
 // submits them to the unified task queue. Workers process them concurrently
 // alongside page tasks — there is no per-page wait.
 func (s *Scraper) submitReferences(index *htmlindex.Index) {
-	// Collect body background images
-	references, err := index.URLs(htmlindex.BodyTag)
-	if err != nil {
-		s.logger.Error("Getting body node URLs failed", log.Err(err))
-	}
-	for _, u := range references {
-		s.submitAsset(u, s.checkImageForRecode)
-	}
-
-	// Collect img tags
-	references, err = index.URLs(htmlindex.ImgTag)
-	if err != nil {
-		s.logger.Error("Getting img node URLs failed", log.Err(err))
-	}
-	for _, u := range references {
-		s.submitAsset(u, s.checkImageForRecode)
+	// Body background images + img tags share the image processor.
+	for _, tag := range []string{htmlindex.BodyTag, htmlindex.ImgTag} {
+		references, err := index.URLs(tag)
+		if err != nil {
+			s.logger.Error("Getting node URLs failed",
+				log.String("node", tag),
+				log.Err(err))
+		}
+		for _, u := range references {
+			s.submitAsset(u, s.checkImageForRecode)
+		}
 	}
 
 	// Skip CSS/JS downloads in markdown mode — only images/fonts/media are needed.
-	if !s.config.Markdown {
-		for _, tag := range tagsWithReferences {
-			references, err = index.URLs(tag)
-			if err != nil {
-				s.logger.Error("Getting node URLs failed",
-					log.String("node", tag),
-					log.Err(err))
-			}
+	if s.config.Markdown {
+		return
+	}
+	for _, tag := range tagsWithReferences {
+		references, err := index.URLs(tag)
+		if err != nil {
+			s.logger.Error("Getting node URLs failed",
+				log.String("node", tag),
+				log.Err(err))
+		}
 
-			var processor assetProcessor
-			switch tag {
-			case htmlindex.LinkTag, htmlindex.StyleTag, htmlindex.InlineStyleTag:
-				processor = s.cssProcessor
-			case htmlindex.ScriptTag:
-				processor = s.jsProcessor
-			}
-			for _, ur := range references {
-				s.submitAsset(ur, processor)
-			}
+		var processor assetProcessor
+		switch tag {
+		case htmlindex.LinkTag, htmlindex.StyleTag, htmlindex.InlineStyleTag:
+			processor = s.cssProcessor
+		case htmlindex.ScriptTag:
+			processor = s.jsProcessor
+		}
+		for _, ur := range references {
+			s.submitAsset(ur, processor)
 		}
 	}
 }
@@ -110,53 +106,37 @@ func (s *Scraper) downloadAsset(ctx context.Context, u *url.URL, processor asset
 	// the entire response body in memory. This keeps memory bounded regardless
 	// of asset size (videos, large PDFs, etc.).
 	if processor == nil {
-		if err := s.dirCreator(filepath.Dir(filePath)); err != nil {
-			s.logger.Error("Creating asset directory failed",
-				log.String("url", urlFull),
-				log.String("dir", filepath.Dir(filePath)),
-				log.Err(err))
-			s.addFailedURL(urlFull, err)
-			s.emit(Event{Kind: EventFailed, URL: urlFull, Err: err.Error()})
-			return fmt.Errorf("creating asset directory: %w", err)
-		}
-		_, err := s.httpStreamer(ctx, u, filePath)
-		if err != nil {
-			if s.config.Skip403 && IsHTTPStatusError(err, http.StatusForbidden) {
-				s.incrementProgress()
-				s.emit(Event{Kind: EventSkipped, URL: urlFull, Message: "asset 403, skipped"})
-				return nil
-			}
-			s.unmarkURLProcessed(u)
-			s.logger.Error("Downloading asset failed",
-				log.String("url", urlFull),
-				log.Err(err))
-			s.addFailedURL(urlFull, err)
-			s.emit(Event{Kind: EventFailed, URL: urlFull, Err: err.Error()})
-			return fmt.Errorf("downloading asset: %w", err)
-		}
-		s.incrementProgress()
-		s.emit(Event{Kind: EventAssetDone, URL: urlFull})
-		return nil
+		return s.streamAssetToDisk(ctx, u, urlFull, filePath)
 	}
+	return s.bufferAndProcessAsset(ctx, u, urlFull, filePath, processor)
+}
 
-	// Processor needed — buffer the response so the processor can transform it.
-	data, _, err := s.httpDownloader(ctx, u)
-	if err != nil {
-		// Skip silently if configured and error is 403 Forbidden
-		if s.config.Skip403 && IsHTTPStatusError(err, http.StatusForbidden) {
-			s.incrementProgress()
-			s.emit(Event{Kind: EventSkipped, URL: urlFull, Message: "asset 403, skipped"})
-			return nil
-		}
-		// Unmark failed asset so it can be retried if discovered again
-		// (e.g., same image referenced in both HTML and CSS)
-		s.unmarkURLProcessed(u)
-		s.logger.Error("Downloading asset failed",
+// streamAssetToDisk handles the no-processor path: ensure dir, stream
+// body to file, emit lifecycle events.
+func (s *Scraper) streamAssetToDisk(ctx context.Context, u *url.URL, urlFull, filePath string) error {
+	if err := s.dirCreator(filepath.Dir(filePath)); err != nil {
+		s.logger.Error("Creating asset directory failed",
 			log.String("url", urlFull),
+			log.String("dir", filepath.Dir(filePath)),
 			log.Err(err))
 		s.addFailedURL(urlFull, err)
 		s.emit(Event{Kind: EventFailed, URL: urlFull, Err: err.Error()})
-		return fmt.Errorf("downloading asset: %w", err)
+		return fmt.Errorf("creating asset directory: %w", err)
+	}
+	if _, err := s.httpStreamer(ctx, u, filePath); err != nil {
+		return s.handleAssetDownloadError(u, urlFull, err)
+	}
+	s.incrementProgress()
+	s.emit(Event{Kind: EventAssetDone, URL: urlFull})
+	return nil
+}
+
+// bufferAndProcessAsset handles the processor path: buffer response,
+// transform via processor, write to disk, emit lifecycle events.
+func (s *Scraper) bufferAndProcessAsset(ctx context.Context, u *url.URL, urlFull, filePath string, processor assetProcessor) error {
+	data, _, err := s.httpDownloader(ctx, u)
+	if err != nil {
+		return s.handleAssetDownloadError(u, urlFull, err)
 	}
 
 	data = processor(u, data)
@@ -171,6 +151,26 @@ func (s *Scraper) downloadAsset(ctx context.Context, u *url.URL, processor asset
 	s.incrementProgress()
 	s.emit(Event{Kind: EventAssetDone, URL: urlFull})
 	return nil
+}
+
+// handleAssetDownloadError dispatches an asset HTTP download failure:
+// 403 is silently skipped under config.Skip403; other errors mark the URL
+// unprocessed (so a later discovery can retry), log, and emit EventFailed.
+func (s *Scraper) handleAssetDownloadError(u *url.URL, urlFull string, err error) error {
+	if s.config.Skip403 && IsHTTPStatusError(err, http.StatusForbidden) {
+		s.incrementProgress()
+		s.emit(Event{Kind: EventSkipped, URL: urlFull, Message: "asset 403, skipped"})
+		return nil
+	}
+	// Unmark so a later discovery of the same asset (e.g. referenced from
+	// HTML and CSS) can retry instead of being deduped silently.
+	s.unmarkURLProcessed(u)
+	s.logger.Error("Downloading asset failed",
+		log.String("url", urlFull),
+		log.Err(err))
+	s.addFailedURL(urlFull, err)
+	s.emit(Event{Kind: EventFailed, URL: urlFull, Err: err.Error()})
+	return fmt.Errorf("downloading asset: %w", err)
 }
 
 func (s *Scraper) cssProcessor(baseURL *url.URL, data []byte) []byte {

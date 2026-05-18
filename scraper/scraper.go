@@ -91,7 +91,7 @@ type Config struct {
 
 type (
 	httpDownloader     func(ctx context.Context, u *url.URL) ([]byte, *url.URL, error)
-	httpStreamer        func(ctx context.Context, u *url.URL, filePath string) (*url.URL, error)
+	httpStreamer       func(ctx context.Context, u *url.URL, filePath string) (*url.URL, error)
 	dirCreator         func(path string) error
 	fileExistenceCheck func(filePath string) bool
 	fileWriter         func(filePath string, data []byte) error
@@ -160,7 +160,7 @@ type Scraper struct {
 	fileExistenceCheck fileExistenceCheck
 	fileWriter         fileWriter
 	httpDownloader     httpDownloader
-	httpStreamer        httpStreamer
+	httpStreamer       httpStreamer
 
 	// Rate limiting (per-host)
 	hostLimiter *hostLimiter
@@ -220,11 +220,12 @@ func New(logger *log.Logger, cfg Config) (*Scraper, error) {
 		return nil, fmt.Errorf("creating proxy transport: %w", err)
 	}
 
-	// Set default concurrency early so transport tuning can reference it.
-	concurrency := cfg.Concurrency
-	if concurrency <= 0 {
-		concurrency = 1
+	// Normalize concurrency once so both transport tuning and the worker
+	// pool read the same value.
+	if cfg.Concurrency <= 0 {
+		cfg.Concurrency = 1
 	}
+	concurrency := cfg.Concurrency
 
 	// Tune transport for connection reuse under concurrent load.
 	// Override DisableKeepAlives (set to true by gotokit SOCKS5 transport) to allow reuse.
@@ -319,16 +320,7 @@ func New(logger *log.Logger, cfg Config) (*Scraper, error) {
 
 	// Initialize per-host rate limiter if configured
 	if cfg.RateLimit > 0 {
-		burst := cfg.Concurrency
-		if burst < 1 {
-			burst = 1
-		}
-		s.hostLimiter = newHostLimiter(rate.Limit(cfg.RateLimit), burst)
-	}
-
-	// Set default concurrency
-	if s.config.Concurrency <= 0 {
-		s.config.Concurrency = 1
+		s.hostLimiter = newHostLimiter(rate.Limit(cfg.RateLimit), cfg.Concurrency)
 	}
 
 	return s, nil
@@ -425,11 +417,8 @@ func (s *Scraper) processTask(ctx context.Context, t task) {
 			}
 		}
 	case taskAsset:
-		if err := s.downloadAsset(ctx, t.url, t.processor); err != nil {
-			if !errors.Is(err, context.Canceled) {
-				// Error already logged inside downloadAsset
-			}
-		}
+		// downloadAsset logs its own errors; discard the return.
+		_ = s.downloadAsset(ctx, t.url, t.processor)
 	}
 }
 

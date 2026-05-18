@@ -13,13 +13,13 @@ import (
 
 // Package-level compiled regexes for markdown cleanup.
 var (
-	emptyImagePattern        = regexp.MustCompile(`!\[\s*\]\(\s*\)`)
-	autolinkConvertPattern   = regexp.MustCompile(`\[\s*\]\(([^)\s][^)]*)\)`)
-	textOnlyLinkPattern      = regexp.MustCompile(`\[([^\]]+)\]\(\s*\)`)
-	emptyLinkPattern         = regexp.MustCompile(`\[\s*\]\(\s*\)`)
-	emptyHeadingPattern      = regexp.MustCompile(`^\s*#{1,6}\s*$`)
+	emptyImagePattern         = regexp.MustCompile(`!\[\s*\]\(\s*\)`)
+	autolinkConvertPattern    = regexp.MustCompile(`\[\s*\]\(([^)\s][^)]*)\)`)
+	textOnlyLinkPattern       = regexp.MustCompile(`\[([^\]]+)\]\(\s*\)`)
+	emptyLinkPattern          = regexp.MustCompile(`\[\s*\]\(\s*\)`)
+	emptyHeadingPattern       = regexp.MustCompile(`^\s*#{1,6}\s*$`)
 	trailingWhitespacePattern = regexp.MustCompile(`[ \t]+$`)
-	multiBlankPattern        = regexp.MustCompile(`\n{3,}`)
+	multiBlankPattern         = regexp.MustCompile(`\n{3,}`)
 )
 
 // convertToMarkdown converts an HTML document AST to Markdown bytes with

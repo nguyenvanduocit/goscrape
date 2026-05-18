@@ -2,6 +2,7 @@ package scraper
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"testing"
@@ -73,7 +74,7 @@ func TestScraperLinks(t *testing.T) {
 
 	startURL := "https://example.org/#fragment" // start page with fragment
 	urls := map[string][]byte{
-		"https://example.org/":          indexPage,
+		testStartURL:                    indexPage,
 		"https://example.org/page2":     page2,
 		"https://example.org/sub/":      indexPage,
 		"https://example.org/style.css": css,
@@ -111,9 +112,9 @@ func TestScraperAttributes(t *testing.T) {
 `)
 	empty := []byte(``)
 
-	startURL := "https://example.org/"
+	startURL := testStartURL
 	urls := map[string][]byte{
-		"https://example.org/":       indexPage,
+		testStartURL:                 indexPage,
 		"https://example.org/bg.gif": empty,
 	}
 
@@ -197,7 +198,7 @@ h3 {
 func TestStart_403OnStartPage_ReturnsError(t *testing.T) {
 	logger := log.NewTestLogger(t)
 	cfg := Config{
-		URL: "https://example.org/",
+		URL: testStartURL,
 	}
 	s, err := New(logger, cfg)
 	require.NoError(t, err)
@@ -223,9 +224,9 @@ func TestProcessURL_403OnSubpage_ContinuesCrawling(t *testing.T) {
 `)
 	publicPage := []byte(`<html><body>public content</body></html>`)
 
-	startURL := "https://example.org/"
+	startURL := testStartURL
 	urls := map[string][]byte{
-		"https://example.org/":       indexPage,
+		testStartURL:                 indexPage,
 		"https://example.org/public": publicPage,
 	}
 
@@ -251,7 +252,7 @@ func TestProcessURL_SkipExisting_FileExists_SkipsDownload(t *testing.T) {
 <a href="https://example.org/child2">child2</a>
 </body></html>
 `)
-	startURL := "https://example.org/"
+	startURL := testStartURL
 
 	logger := log.NewTestLogger(t)
 	cfg := Config{
@@ -296,9 +297,9 @@ func TestProcessURL_SkipExisting_FileMissing_FallsThrough(t *testing.T) {
 </body></html>
 `)
 	child1Page := []byte(`<html><body>child content</body></html>`)
-	startURL := "https://example.org/"
+	startURL := testStartURL
 	urls := map[string][]byte{
-		"https://example.org/":       indexPage,
+		testStartURL:                 indexPage,
 		"https://example.org/child1": child1Page,
 	}
 
@@ -334,7 +335,7 @@ func TestProcessURL_SkipExisting_FileMissing_FallsThrough(t *testing.T) {
 }
 
 func TestProcessURL_SkipExistingMarkdown_NoChildren(t *testing.T) {
-	startURL := "https://example.org/"
+	startURL := testStartURL
 
 	logger := log.NewTestLogger(t)
 	cfg := Config{
@@ -346,9 +347,9 @@ func TestProcessURL_SkipExistingMarkdown_NoChildren(t *testing.T) {
 	require.NoError(t, err)
 
 	var downloadCount int
-	s.httpDownloader = func(_ context.Context, u *url.URL) ([]byte, *url.URL, error) {
+	s.httpDownloader = func(_ context.Context, _ *url.URL) ([]byte, *url.URL, error) {
 		downloadCount++
-		return nil, nil, fmt.Errorf("should not be called")
+		return nil, nil, errors.New("should not be called")
 	}
 	s.dirCreator = func(_ string) error { return nil }
 	s.fileWriter = func(_ string, _ []byte) error { return nil }
@@ -375,9 +376,9 @@ func TestURLRewriteVerification(t *testing.T) {
 </body></html>
 `)
 
-	startURL := "https://example.org/"
+	startURL := testStartURL
 	urls := map[string][]byte{
-		"https://example.org/": indexPage,
+		testStartURL: indexPage,
 	}
 
 	s := newTestScraper(t, startURL, urls)

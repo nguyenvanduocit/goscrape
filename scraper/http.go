@@ -126,37 +126,35 @@ func (s *Scraper) downloadURL(ctx context.Context, u *url.URL) (*http.Response, 
 	return resp, nil
 }
 
-func (s *Scraper) downloadURLWithRetries(ctx context.Context, u *url.URL) ([]byte, *url.URL, error) {
-	// Apply per-host rate limiting if configured
+// requestWithRetry handles rate limiting, delay, retry loop, and Retry-After
+// parsing. It returns the first non-retryable HTTP response (success OR
+// permanent error like 403) and transfers body ownership to the caller —
+// the caller MUST close resp.Body and is responsible for status checking
+// and body consumption.
+func (s *Scraper) requestWithRetry(ctx context.Context, u *url.URL) (*http.Response, error) {
 	if err := s.hostLimiter.Wait(ctx, u.Host); err != nil {
-		return nil, nil, fmt.Errorf("rate limiter: %w", err)
+		return nil, fmt.Errorf("rate limiter: %w", err)
 	}
-
-	// Apply delay if configured
 	if s.config.Delay > 0 {
 		if err := app.Sleep(ctx, time.Duration(s.config.Delay)*time.Millisecond); err != nil {
-			return nil, nil, fmt.Errorf("delay: %w", err)
+			return nil, fmt.Errorf("delay: %w", err)
 		}
 	}
 
-	var resp *http.Response
-
 	for attempt := range maxRetries + 1 {
-		var err error
-		resp, err = s.downloadURL(ctx, u)
+		resp, err := s.downloadURL(ctx, u)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
-
 		if !retryableStatusCodes[resp.StatusCode] {
-			break
+			return resp, nil
 		}
 
 		retryAfterHeader := resp.Header.Get("Retry-After")
 		_ = resp.Body.Close()
 
 		if attempt == maxRetries {
-			return nil, nil, fmt.Errorf("%w for URL %s", errExhaustedRetries, u)
+			return nil, fmt.Errorf("%w for URL %s", errExhaustedRetries, u)
 		}
 
 		s.logger.Warn("Retryable HTTP status. Retrying",
@@ -171,24 +169,43 @@ func (s *Scraper) downloadURLWithRetries(ctx context.Context, u *url.URL) ([]byt
 			sleep = ra // honor server signal verbatim, no jitter
 		}
 		if err := app.Sleep(ctx, sleep); err != nil {
-			return nil, nil, fmt.Errorf("sleeping between retries: %w", err)
+			return nil, fmt.Errorf("sleeping between retries: %w", err)
 		}
 	}
+	// Unreachable: the loop either returns on success or on retry exhaustion.
+	return nil, fmt.Errorf("%w for URL %s", errExhaustedRetries, u)
+}
 
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			s.logger.Error("Closing HTTP Request body failed",
-				log.String("url", u.String()),
-				log.Err(err))
-		}
-	}()
+// checkResponseStatus returns an HTTPStatusError for non-200 responses,
+// logging a warning for 403 (typically permanent denial).
+func (s *Scraper) checkResponseStatus(resp *http.Response, u *url.URL) error {
+	if resp.StatusCode == http.StatusOK {
+		return nil
+	}
+	if resp.StatusCode == http.StatusForbidden {
+		s.logger.Warn("HTTP 403 Forbidden, skipping", log.String("url", u.String()))
+	}
+	return &HTTPStatusError{StatusCode: resp.StatusCode, URL: u.String()}
+}
 
-	if resp.StatusCode != http.StatusOK {
-		if resp.StatusCode == http.StatusForbidden {
-			s.logger.Warn("HTTP 403 Forbidden, skipping",
-				log.String("url", u.String()))
-		}
-		return nil, nil, &HTTPStatusError{StatusCode: resp.StatusCode, URL: u.String()}
+// closeResponseBody closes resp.Body and logs any close error.
+func (s *Scraper) closeResponseBody(resp *http.Response, u *url.URL) {
+	if err := resp.Body.Close(); err != nil {
+		s.logger.Error("Closing HTTP request body failed",
+			log.String("url", u.String()),
+			log.Err(err))
+	}
+}
+
+func (s *Scraper) downloadURLWithRetries(ctx context.Context, u *url.URL) ([]byte, *url.URL, error) {
+	resp, err := s.requestWithRetry(ctx, u)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer s.closeResponseBody(resp, u)
+
+	if err := s.checkResponseStatus(resp, u); err != nil {
+		return nil, nil, err
 	}
 
 	buf := &bytes.Buffer{}
@@ -208,68 +225,14 @@ func (s *Scraper) downloadURLWithRetries(ctx context.Context, u *url.URL) ([]byt
 // Caller must ensure the parent directory exists before calling.
 // On any error after os.Create, the partial file is removed.
 func (s *Scraper) downloadURLStreaming(ctx context.Context, u *url.URL, filePath string) (*url.URL, error) {
-	// Apply per-host rate limiting if configured.
-	if err := s.hostLimiter.Wait(ctx, u.Host); err != nil {
-		return nil, fmt.Errorf("rate limiter: %w", err)
+	resp, err := s.requestWithRetry(ctx, u)
+	if err != nil {
+		return nil, err
 	}
+	defer s.closeResponseBody(resp, u)
 
-	// Apply delay if configured.
-	if s.config.Delay > 0 {
-		if err := app.Sleep(ctx, time.Duration(s.config.Delay)*time.Millisecond); err != nil {
-			return nil, fmt.Errorf("delay: %w", err)
-		}
-	}
-
-	var resp *http.Response
-
-	for attempt := range maxRetries + 1 {
-		var err error
-		resp, err = s.downloadURL(ctx, u)
-		if err != nil {
-			return nil, err
-		}
-
-		if !retryableStatusCodes[resp.StatusCode] {
-			break
-		}
-
-		retryAfterHeader := resp.Header.Get("Retry-After")
-		_ = resp.Body.Close()
-
-		if attempt == maxRetries {
-			return nil, fmt.Errorf("%w for URL %s", errExhaustedRetries, u)
-		}
-
-		s.logger.Warn("Retryable HTTP status. Retrying",
-			log.Int("status", resp.StatusCode),
-			log.Int("attempt", attempt+1),
-			log.Int("max", maxRetries),
-			log.String("url", u.String()))
-
-		sleep := time.Duration(attempt+1) * retryDelay
-		sleep += time.Duration(rand.Int64N(int64(retryDelay)))
-		if ra := parseRetryAfter(retryAfterHeader); ra > 0 {
-			sleep = ra
-		}
-		if err := app.Sleep(ctx, sleep); err != nil {
-			return nil, fmt.Errorf("sleeping between retries: %w", err)
-		}
-	}
-
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			s.logger.Error("Closing HTTP request body failed",
-				log.String("url", u.String()),
-				log.Err(err))
-		}
-	}()
-
-	if resp.StatusCode != http.StatusOK {
-		if resp.StatusCode == http.StatusForbidden {
-			s.logger.Warn("HTTP 403 Forbidden, skipping",
-				log.String("url", u.String()))
-		}
-		return nil, &HTTPStatusError{StatusCode: resp.StatusCode, URL: u.String()}
+	if err := s.checkResponseStatus(resp, u); err != nil {
+		return nil, err
 	}
 
 	f, err := os.Create(filePath)
@@ -282,13 +245,14 @@ func (s *Scraper) downloadURLStreaming(ctx context.Context, u *url.URL, filePath
 
 	if copyErr != nil || n > streamingMaxBytes || closeErr != nil {
 		_ = os.Remove(filePath) // remove partial file on any failure
-		if copyErr != nil {
+		switch {
+		case copyErr != nil:
 			return nil, fmt.Errorf("streaming response body to file: %w", copyErr)
-		}
-		if n > streamingMaxBytes {
+		case n > streamingMaxBytes:
 			return nil, fmt.Errorf("response body exceeded %d bytes for URL %s", streamingMaxBytes, u.String())
+		default:
+			return nil, fmt.Errorf("closing streamed file: %w", closeErr)
 		}
-		return nil, fmt.Errorf("closing streamed file: %w", closeErr)
 	}
 
 	return resp.Request.URL, nil

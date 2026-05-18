@@ -3,11 +3,12 @@ package scraper
 import (
 	"bytes"
 	"context"
-	"fmt"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -122,7 +123,7 @@ func TestDownloadAssetStreaming(t *testing.T) {
 	var bufferedCalled bool
 	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "video/mp4")
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", assetSize))
+		w.Header().Set("Content-Length", strconv.Itoa(assetSize))
 		_, _ = w.Write(assetBody)
 	}))
 	defer svr.Close()
@@ -139,7 +140,7 @@ func TestDownloadAssetStreaming(t *testing.T) {
 	// Redirect the buffered downloader to a sentinel so we can detect misuse.
 	s.httpDownloader = func(_ context.Context, _ *url.URL) ([]byte, *url.URL, error) {
 		bufferedCalled = true
-		return nil, nil, fmt.Errorf("buffered path should not be called for no-processor asset")
+		return nil, nil, errors.New("buffered path should not be called for no-processor asset")
 	}
 
 	// fileExistenceCheck must say "not cached" so downloadAsset doesn't short-circuit.
@@ -159,6 +160,6 @@ func TestDownloadAssetStreaming(t *testing.T) {
 	filePath := s.getFilePath(assetURL, false)
 	data, err := os.ReadFile(filePath)
 	require.NoError(t, err, "streamed file should exist at %s", filePath)
-	assert.Equal(t, assetSize, len(data), "file size should match response body")
+	assert.Len(t, data, assetSize, "file size should match response body")
 	assert.Equal(t, assetBody, data, "file content should match response body")
 }

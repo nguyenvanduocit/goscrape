@@ -11,6 +11,7 @@ import (
 	"cmp"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -160,7 +161,9 @@ func New(target string) Model {
 func (m Model) Init() tea.Cmd { return tickCmd() }
 
 // Update mutates the model in response to messages and returns the next
-// command.
+// command. The tea.Model return is dictated by bubbletea's interface.
+//
+//nolint:ireturn // required by tea.Model interface
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
@@ -197,7 +200,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// applyEvent folds a single scraper event into the model.
+// applyEvent folds a single scraper event into the model. Complexity
+// scales with the event-kind switch; each branch is a coherent state
+// transition.
+//
+//nolint:cyclop,funlen // event-state-machine dispatch
 func (m Model) applyEvent(ev scraper.Event) Model {
 	switch ev.Kind {
 	case scraper.EventPageDiscovered:
@@ -495,12 +502,12 @@ func (m Model) renderStats(w int) string {
 	}
 
 	row := lipgloss.JoinHorizontal(lipgloss.Top,
-		mkCard("PAGES OK", fmt.Sprintf("%d", m.pagesOK), colorSuccess),
-		mkCard("PAGES FAIL", fmt.Sprintf("%d", m.pagesFailed), pageFailedColor),
-		mkCard("ASSETS OK", fmt.Sprintf("%d", m.assetsOK), colorSuccess),
-		mkCard("ASSETS FAIL", fmt.Sprintf("%d", m.assetsFailed), assetFailedColor),
-		mkCard("SKIPPED", fmt.Sprintf("%d", m.skipped), colorWarning),
-		mkCard("QUEUE", fmt.Sprintf("%d", m.queueSize), colorInfo),
+		mkCard("PAGES OK", strconv.Itoa(m.pagesOK), colorSuccess),
+		mkCard("PAGES FAIL", strconv.Itoa(m.pagesFailed), pageFailedColor),
+		mkCard("ASSETS OK", strconv.Itoa(m.assetsOK), colorSuccess),
+		mkCard("ASSETS FAIL", strconv.Itoa(m.assetsFailed), assetFailedColor),
+		mkCard("SKIPPED", strconv.Itoa(m.skipped), colorWarning),
+		mkCard("QUEUE", strconv.Itoa(m.queueSize), colorInfo),
 	)
 	return row
 }
@@ -589,7 +596,7 @@ func (m Model) renderInflightAssets() string {
 		overflow = limit - maxInflightShown
 		limit = maxInflightShown
 	}
-	for i := 0; i < limit; i++ {
+	for i := range limit {
 		p := pairs[i]
 		dur := fmtDuration(time.Since(p.started))
 		fmt.Fprintf(&b, "  %s %s  %s\n",
@@ -759,20 +766,20 @@ func containsString(ss []string, s string) bool {
 	return false
 }
 
-// truncate shortens s to fit within max, adding an ellipsis. Operates on
-// rune count, not bytes — Unicode-safe for non-ASCII URLs.
-func truncate(s string, max int) string {
-	if max <= 0 {
+// truncate shortens s to fit within maxLen runes, adding an ellipsis.
+// Operates on rune count, not bytes — Unicode-safe for non-ASCII URLs.
+func truncate(s string, maxLen int) string {
+	if maxLen <= 0 {
 		return ""
 	}
 	runes := []rune(s)
-	if len(runes) <= max {
+	if len(runes) <= maxLen {
 		return s
 	}
-	if max <= 1 {
+	if maxLen <= 1 {
 		return "…"
 	}
-	return string(runes[:max-1]) + "…"
+	return string(runes[:maxLen-1]) + "…"
 }
 
 // fmtDuration prints a duration as a compact h/m/s string.
