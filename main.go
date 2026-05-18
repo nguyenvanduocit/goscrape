@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 
@@ -74,6 +75,11 @@ type arguments struct {
 
 	// Skip existing
 	SkipExisting bool `arg:"--skip-existing" help:"skip download if the target file already exists on disk; useful for resuming an interrupted crawl"`
+
+	// Include query string in dedup key and on-disk filename. Off by default
+	// because tracking/session params can explode crawl size; enable for sites
+	// where ?id=1 vs ?id=2 are genuinely different content.
+	IncludeQuery bool `arg:"--include-query" help:"distinguish URLs that differ only in query string (default: query is dropped from dedup key and filename)"`
 }
 
 func (arguments) Description() string {
@@ -156,12 +162,64 @@ func readArguments() (arguments, error) {
 		return arguments{}, fmt.Errorf("parsing arguments: %w", err)
 	}
 
+	// Validate BEFORE the URL-empty shortcut so "--depth -1" with no URL
+	// still surfaces the input error instead of silently printing help.
+	if err := validateArguments(&args); err != nil {
+		return arguments{}, err
+	}
+
 	if len(args.URLs) == 0 && args.Serve == "" {
 		parser.WriteHelp(os.Stdout)
 		os.Exit(0)
 	}
 
 	return args, nil
+}
+
+// Argument bounds — picked to catch obviously broken input without
+// constraining legitimate use. Zero is allowed where it has well-defined
+// semantics (timeout/delay 0 = none, depth 0 = unlimited, etc.).
+const (
+	maxDepth       = 1000
+	maxTimeoutSecs = 86400 // 1 day
+	maxDelayMillis = 60_000
+	maxConcurrency = 1000
+	maxRateLimit   = 1000.0
+)
+
+// validateArguments rejects negative numeric flags (which would silently
+// cast to enormous uint values) and applies sanity caps so a typo can't
+// turn into a multi-day sleep or runaway worker pool.
+func validateArguments(args *arguments) error {
+	type rangedInt struct {
+		name     string
+		value    int64
+		min, max int64
+		unit     string
+	}
+	for _, c := range []rangedInt{
+		{"--depth", args.Depth, 0, maxDepth, ""},
+		{"--timeout", args.Timeout, 0, maxTimeoutSecs, " seconds"},
+		{"--delay", args.Delay, 0, maxDelayMillis, " milliseconds"},
+		{"--concurrency", int64(args.Concurrency), 0, maxConcurrency, ""},
+		{"--imagequality", args.ImageQuality, 0, 100, ""},
+	} {
+		if c.value < c.min || c.value > c.max {
+			return fmt.Errorf("%s must be in [%d, %d]%s, got %d", c.name, c.min, c.max, c.unit, c.value)
+		}
+	}
+	if math.IsNaN(args.RateLimit) || math.IsInf(args.RateLimit, 0) {
+		return fmt.Errorf("--rate-limit must be a finite number, got %v", args.RateLimit)
+	}
+	if args.RateLimit < 0 || args.RateLimit > maxRateLimit {
+		return fmt.Errorf("--rate-limit must be in [0, %.0f] req/s, got %g", maxRateLimit, args.RateLimit)
+	}
+	// int16 ServerPort already caps at 32767, but still reject negatives so
+	// the message is actionable instead of "address already in use".
+	if args.ServerPort < 0 {
+		return fmt.Errorf("--serverport cannot be negative, got %d", args.ServerPort)
+	}
+	return nil
 }
 
 // applyProfile fills in zero-valued concurrency/rate/delay fields from the named profile.
@@ -268,6 +326,7 @@ func buildScraperConfig(args arguments, cookies []scraper.Cookie) scraper.Config
 		DisableDefaultExcludes: args.NoDefaultExcludes,
 		Markdown:               args.Markdown,
 		SkipExisting:           args.SkipExisting,
+		IncludeQueryInPath:     args.IncludeQuery,
 	}
 }
 
@@ -284,7 +343,7 @@ func scrapeURLs(ctx context.Context, cfg scraper.Config,
 			runErr = runScrape(ctx, cfg, logger, args)
 		}
 		if runErr != nil {
-			if errors.Is(runErr, context.Canceled) {
+			if errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
 				os.Exit(0)
 			}
 			return runErr
@@ -354,7 +413,12 @@ func runWithTUI(ctx context.Context, cfg scraper.Config,
 	if runErr != nil {
 		return fmt.Errorf("running TUI: %w", runErr)
 	}
-	if scrapeErr != nil && !errors.Is(scrapeErr, context.Canceled) {
+	if scrapeErr != nil {
+		if errors.Is(scrapeErr, context.Canceled) || errors.Is(scrapeErr, context.DeadlineExceeded) {
+			// User aborted mid-flight; skip finalize so we don't write a
+			// misleading success log/cookie snapshot.
+			return nil
+		}
 		return fmt.Errorf("scraping '%s': %w", sc.URL, scrapeErr)
 	}
 

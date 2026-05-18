@@ -83,6 +83,13 @@ type Config struct {
 	// queued. A one-time warning is logged at Start().
 	SkipExisting bool
 
+	// IncludeQueryInPath, when true, makes the dedup key and on-disk filename
+	// distinguish URLs that differ only in their query string. Default is false
+	// (queries are dropped) because including them can explode crawl size when
+	// the target site uses tracking/session params. Enable when scraping sites
+	// where ?id=1 vs ?id=2 represent genuinely different content.
+	IncludeQueryInPath bool
+
 	// OnEvent is an optional consumer callback for scraping lifecycle events.
 	// When set, the scraper emits events for page/asset downloads, skips, and
 	// failures. Handlers MUST be non-blocking — they run on the scraper goroutine.
@@ -96,6 +103,11 @@ type (
 	fileExistenceCheck func(filePath string) bool
 	fileWriter         func(filePath string, data []byte) error
 )
+
+// ErrBlockedPrivateAddress is wrapped into the dial error when SSRF protection
+// rejects a connection. Exported as a sentinel so retry logic can recognize
+// the permanent failure via errors.Is and avoid wasting retries on it.
+var ErrBlockedPrivateAddress = errors.New("blocked request to private/internal address")
 
 // blockedIPRanges contains IP ranges that should be blocked for SSRF protection
 // beyond what Go's IsLoopback/IsPrivate/IsLinkLocal covers.
@@ -178,6 +190,30 @@ type Scraper struct {
 
 	// allowedCDN contains external domains allowed for asset downloads
 	allowedCDN set.Set[string]
+
+	// casePathRegistry maps a lowercased filesystem path to the casePathClaim
+	// (cased path + URL identity) that first claimed it. Used to disambiguate
+	// URLs that differ only in case (e.g. /Logo.png vs /logo.png) on
+	// case-insensitive filesystems (macOS, Windows). See disambiguateCaseCollision.
+	casePathRegistry sync.Map
+}
+
+// casePathClaim records both the cased filesystem path that won a lowercased
+// registry slot AND the URL that claimed it. The synthetic flag distinguishes
+// natural claims (URL's own filepath mapping) from collision-suffix claims
+// (allocated by the disambiguation loop). Together these let the logic
+// distinguish:
+//   - same URL re-asking (return previously-claimed path)
+//   - different URLs that legitimately share a filepath, e.g. via query-drop
+//     (return as-is, accept intentional same-target write)
+//   - different URLs whose paths only differ in case (allocate a new suffixed
+//     filename so they don't clobber on macOS/Windows)
+//   - a literal URL that happens to match a previously-allocated synthetic
+//     slot (force a fresh suffix so neither URL is silently clobbered)
+type casePathClaim struct {
+	cased     string
+	url       string
+	synthetic bool
 }
 
 // New creates a new Scraper instance.
@@ -272,7 +308,7 @@ func New(logger *log.Logger, cfg Config) (*Scraper, error) {
 				continue
 			}
 			if isBlockedIP(ip) {
-				return nil, fmt.Errorf("blocked request to private/internal address: %s (%s)", host, ipStr)
+				return nil, fmt.Errorf("%w: %s (%s)", ErrBlockedPrivateAddress, host, ipStr)
 			}
 		}
 		// Dial the verified IP directly to prevent DNS rebinding attacks.
@@ -331,23 +367,10 @@ func (s *Scraper) Start(ctx context.Context) error {
 	if err := s.dirCreator(s.config.OutputDirectory); err != nil {
 		return err
 	}
-
-	// Initialize progress bar if configured
-	if s.config.ShowProgress {
-		s.progress = progressbar.NewOptions(-1,
-			progressbar.OptionSetDescription("Downloading"),
-			progressbar.OptionShowCount(),
-			progressbar.OptionSpinnerType(14),
-			progressbar.OptionSetPredictTime(false),
-			progressbar.OptionClearOnFinish(),
-		)
-	}
-
+	s.initProgressBar()
 	if s.config.SkipExisting {
 		s.logger.Warn("--skip-existing: cached pages cannot be re-parsed for child links (URLs are rewritten to local paths). Children of skipped pages will NOT be discovered. Re-run without --skip-existing for a full crawl.")
 	}
-
-	// Fetch robots.txt if configured
 	if s.config.RespectRobots {
 		s.fetchRobotsTxt(ctx)
 	}
@@ -367,9 +390,40 @@ func (s *Scraper) Start(ctx context.Context) error {
 		return err
 	}
 
-	// Spawn workers to drain remaining tasks (child pages + assets submitted
-	// by the start page's processURL). closeWhenDone returns immediately if
-	// the start page submitted nothing.
+	s.runWorkers(ctx)
+
+	if s.progress != nil {
+		_ = s.progress.Finish()
+	}
+
+	// Surface cancellation so callers can distinguish a clean finish from
+	// a mid-flight abort (the TUI uses this to skip the success path).
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("scrape aborted: %w", err)
+	}
+	return nil
+}
+
+// initProgressBar installs a CLI progress bar when configured. Has no effect
+// when --no-progress is set or when running under the TUI.
+func (s *Scraper) initProgressBar() {
+	if !s.config.ShowProgress {
+		return
+	}
+	s.progress = progressbar.NewOptions(-1,
+		progressbar.OptionSetDescription("Downloading"),
+		progressbar.OptionShowCount(),
+		progressbar.OptionSpinnerType(14),
+		progressbar.OptionSetPredictTime(false),
+		progressbar.OptionClearOnFinish(),
+	)
+}
+
+// runWorkers spawns the worker pool, kicks off the queue closer, and blocks
+// until every worker has exited (the queue closer closes the channel once
+// all in-flight tasks complete, which lets workers fall out of their range
+// loops).
+func (s *Scraper) runWorkers(ctx context.Context) {
 	var workerWg sync.WaitGroup
 	for range s.config.Concurrency {
 		workerWg.Add(1)
@@ -389,20 +443,8 @@ func (s *Scraper) Start(ctx context.Context) error {
 			}
 		}()
 	}
-
-	// Closer goroutine: waits for all outstanding tasks to complete,
-	// then closes the channel so workers exit their range loops.
 	go s.queue.closeWhenDone()
-
-	// Block until all workers exit.
 	workerWg.Wait()
-
-	// Finish progress bar
-	if s.progress != nil {
-		_ = s.progress.Finish()
-	}
-
-	return nil
 }
 
 // processTask dispatches a task to the appropriate handler based on its kind.
@@ -410,7 +452,7 @@ func (s *Scraper) processTask(ctx context.Context, t task) {
 	switch t.kind {
 	case taskPage:
 		if err := s.processURL(ctx, t.url, t.depth); err != nil {
-			if !errors.Is(err, context.Canceled) {
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 				s.logger.Error("Processing page failed",
 					log.String("url", t.url.String()),
 					log.Err(err))
@@ -451,7 +493,11 @@ func (s *Scraper) processURL(ctx context.Context, u *url.URL, currentDepth uint)
 	index := htmlindex.New(s.logger)
 	index.Index(u, doc)
 
-	s.storeDownload(u, data, doc, index, fileExtension)
+	if storeErr := s.storeDownload(u, data, doc, index, fileExtension); storeErr != nil {
+		s.addFailedURL(u.String(), storeErr)
+		s.emit(Event{Kind: EventFailed, URL: u.String(), Err: storeErr.Error(), Depth: currentDepth})
+		return storeErr
+	}
 	s.submitReferences(index)
 
 	if s.queueChildPages(index, u, currentDepth) {
@@ -572,7 +618,7 @@ func detectFileExtension(data []byte) string {
 // storeDownload writes the download to a file, if a known binary file is detected,
 // processing of the file as page to look for links is skipped.
 func (s *Scraper) storeDownload(u *url.URL, data []byte, doc *html.Node,
-	index *htmlindex.Index, fileExtension string) {
+	index *htmlindex.Index, fileExtension string) error {
 
 	// We need to distinguish between HTML pages and binary files (images, PDFs, etc.)
 	// because they need different file path handling:
@@ -607,13 +653,14 @@ func (s *Scraper) storeDownload(u *url.URL, data []byte, doc *html.Node,
 	}
 
 	filePath := s.getFilePath(u, isHTML)
-	// always update html files, content might have changed
 	if err := s.fileWriter(filePath, data); err != nil {
 		s.logger.Error("Writing to file failed",
 			log.String("URL", u.String()),
 			log.String("file", filePath),
 			log.Err(err))
+		return fmt.Errorf("writing page file %q: %w", filePath, err)
 	}
+	return nil
 }
 
 // compileRegexps compiles the given regex strings to regular expressions

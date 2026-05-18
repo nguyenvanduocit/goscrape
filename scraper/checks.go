@@ -46,84 +46,105 @@ func normalizeURLPath(path string) string {
 	return path
 }
 
-// shouldURLBeDownloaded checks whether a page should be downloaded.
-// nolint: cyclop,funlen
-func (s *Scraper) shouldURLBeDownloaded(url *url.URL, currentDepth uint, isAsset bool) bool {
-	if url.Scheme != "http" && url.Scheme != "https" {
+// shouldURLBeDownloaded returns true when the URL passes every eligibility
+// filter AND has not been seen before. Marking the URL as processed only
+// happens after eligibility succeeds, so URLs rejected by filters/robots/depth
+// stay un-marked and can pass on a later (legitimate) discovery.
+func (s *Scraper) shouldURLBeDownloaded(u *url.URL, currentDepth uint, isAsset bool) bool {
+	if !s.isURLEligible(u, currentDepth, isAsset) {
 		return false
 	}
-
-	p := url.String()
-	if url.Host == s.URL.Host {
-		p = url.Path
-	}
-	if p == "" {
-		p = "/"
-	}
-
-	// Normalize the path for duplicate detection to handle trailing slashes
-	normalizedPath := normalizeURLPath(p)
-
-	// Atomically check-and-mark to prevent duplicate downloads
-	s.processedMu.Lock()
-	if s.processed.Contains(normalizedPath) {
-		s.processedMu.Unlock()
+	if !s.markAsProcessed(u) {
 		return false
 	}
-	s.processed.Add(normalizedPath)
-	s.processedMu.Unlock()
-
-	if url.Host != s.URL.Host {
-		if !isAsset {
-			s.logger.Debug("Skipping external host page", log.String("url", url.String()))
-			return false
-		}
-		// Skip external assets by default, only download if --include-external is passed
-		// or if the host is in the allowed CDN list
-		if s.config.SkipExternalResources && !s.allowedCDN.Contains(url.Host) {
-			s.logger.Debug("Skipping external asset", log.String("url", url.String()))
-			return false
-		}
-	}
-
-	if !isAsset {
-		if s.config.MaxDepth != 0 && currentDepth == s.config.MaxDepth {
-			s.logger.Debug("Skipping too deep level page", log.String("url", url.String()))
-			return false
-		}
-	}
-
-	if s.includes != nil && !s.isURLIncluded(url) {
-		return false
-	}
-	if s.excludes != nil && s.isURLExcluded(url) {
-		return false
-	}
-
-	if !s.config.DisableDefaultExcludes && s.isURLDefaultExcluded(url) {
-		s.logger.Debug("Skipping default-excluded URL", log.String("url", url.String()))
-		return false
-	}
-
-	// Check robots.txt rules if enabled (only for same domain)
-	if s.robotsData != nil && url.Host == s.URL.Host {
-		agent := s.config.UserAgent
-		if agent == "" {
-			agent = "*"
-		}
-		if !s.robotsData.TestAgent(url.Path, agent) {
-			s.logger.Debug("Blocked by robots.txt", log.String("url", url.String()))
-			return false
-		}
-	}
-
-	s.logger.Debug("New URL to download", log.String("url", url.String()))
+	s.logger.Debug("New URL to download", log.String("url", u.String()))
 	return true
 }
 
-// unmarkURLProcessed removes a URL from the processed set, allowing it to be
-// retried if it's discovered again (e.g., same asset referenced in both HTML and CSS).
-func (s *Scraper) unmarkURLProcessed(u *url.URL) {
+// isURLEligible runs every pure eligibility check WITHOUT touching the
+// processed set. Safe to call multiple times for the same URL.
+func (s *Scraper) isURLEligible(u *url.URL, currentDepth uint, isAsset bool) bool {
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	if !s.isHostEligible(u, isAsset) {
+		return false
+	}
+	if !isAsset && s.isDepthExceeded(currentDepth) {
+		s.logger.Debug("Skipping too deep level page", log.String("url", u.String()))
+		return false
+	}
+	if !s.passesUserFilters(u) {
+		return false
+	}
+	if !s.config.DisableDefaultExcludes && s.isURLDefaultExcluded(u) {
+		s.logger.Debug("Skipping default-excluded URL", log.String("url", u.String()))
+		return false
+	}
+	if !s.isRobotsAllowed(u) {
+		s.logger.Debug("Blocked by robots.txt", log.String("url", u.String()))
+		return false
+	}
+	return true
+}
+
+// isHostEligible rejects external pages always, and external assets when
+// neither --include-external nor an allowed-CDN match applies.
+func (s *Scraper) isHostEligible(u *url.URL, isAsset bool) bool {
+	if u.Host == s.URL.Host {
+		return true
+	}
+	if !isAsset {
+		s.logger.Debug("Skipping external host page", log.String("url", u.String()))
+		return false
+	}
+	if s.config.SkipExternalResources && !s.allowedCDN.Contains(u.Host) {
+		s.logger.Debug("Skipping external asset", log.String("url", u.String()))
+		return false
+	}
+	return true
+}
+
+// isDepthExceeded reports whether a page at currentDepth would exceed the
+// configured MaxDepth. MaxDepth == 0 means unlimited.
+func (s *Scraper) isDepthExceeded(currentDepth uint) bool {
+	return s.config.MaxDepth != 0 && currentDepth == s.config.MaxDepth
+}
+
+// passesUserFilters applies user-supplied --include/--exclude regexes.
+func (s *Scraper) passesUserFilters(u *url.URL) bool {
+	if s.includes != nil && !s.isURLIncluded(u) {
+		return false
+	}
+	if s.excludes != nil && s.isURLExcluded(u) {
+		return false
+	}
+	return true
+}
+
+// isRobotsAllowed consults the loaded robots.txt (same-host only). Returns
+// true when robots is disabled, not loaded, or the rule allows the URL.
+func (s *Scraper) isRobotsAllowed(u *url.URL) bool {
+	if s.robotsData == nil || u.Host != s.URL.Host {
+		return true
+	}
+	agent := s.config.UserAgent
+	if agent == "" {
+		agent = "*"
+	}
+	return s.robotsData.TestAgent(u.Path, agent)
+}
+
+// processedKey computes the dedup key for a URL. Same-host URLs key on
+// path (so URLs that differ only in their query string collapse to one
+// entry); external URLs key on the full string. Trailing slash is
+// normalized so "/foo" and "/foo/" map to one key.
+//
+// When Config.IncludeQueryInPath is set, a canonical-sorted query hash
+// is folded into the key so /article?id=1 vs ?id=2 are tracked separately.
+//
+// Used by markAsProcessed and unmarkURLProcessed so both sides stay in sync.
+func (s *Scraper) processedKey(u *url.URL) string {
 	p := u.String()
 	if u.Host == s.URL.Host {
 		p = u.Path
@@ -131,9 +152,41 @@ func (s *Scraper) unmarkURLProcessed(u *url.URL) {
 	if p == "" {
 		p = "/"
 	}
-	normalizedPath := normalizeURLPath(p)
+	key := normalizeURLPath(p)
+	if s.config.IncludeQueryInPath {
+		if h := queryHash(u); h != "" {
+			// Use NUL as the path/query separator so a path containing a
+			// literal "%3F" (decoded "?") cannot collide with the synthetic
+			// "<path>?<hash>" key for a different URL.
+			key += "\x00q=" + h
+		}
+	}
+	return key
+}
+
+// markAsProcessed atomically inserts the URL key into the processed set.
+// Returns true if the URL was newly inserted; false if another call had
+// already inserted it (in which case the caller must NOT proceed).
+func (s *Scraper) markAsProcessed(u *url.URL) bool {
+	key := s.processedKey(u)
 	s.processedMu.Lock()
-	s.processed.Remove(normalizedPath)
+	defer s.processedMu.Unlock()
+	if s.processed.Contains(key) {
+		return false
+	}
+	s.processed.Add(key)
+	return true
+}
+
+// unmarkURLProcessed removes a URL from the processed set so it can be
+// retried by a later discovery. Use ONLY after a URL was accepted (i.e.
+// passed eligibility + got marked) but then failed downstream (download
+// error, write fail, dir-create fail). Do NOT call for URLs rejected by
+// eligibility filters — those are never marked in the first place.
+func (s *Scraper) unmarkURLProcessed(u *url.URL) {
+	key := s.processedKey(u)
+	s.processedMu.Lock()
+	s.processed.Remove(key)
 	s.processedMu.Unlock()
 }
 

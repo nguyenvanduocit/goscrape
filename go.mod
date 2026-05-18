@@ -2,6 +2,8 @@ module github.com/cornelk/goscrape
 
 go 1.25.0
 
+toolchain go1.26.3
+
 require (
 	github.com/JohannesKaufmann/html-to-markdown/v2 v2.5.1
 	github.com/alexflint/go-arg v1.6.0

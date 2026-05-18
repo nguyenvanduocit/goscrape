@@ -28,12 +28,34 @@ func TestResolveURL(t *testing.T) {
 		Path:   "/earth/",
 	}
 
+	// Page one level below root, used to verify links to root resolve
+	// relatively to the on-disk root index, not to a sibling.
+	subdirPage := url.URL{
+		Scheme: "https",
+		Host:   "petpic.xyz",
+		Path:   "/dir/page",
+	}
+	// Page two levels deep, exercises multi-level "../" computation.
+	deeperPage := url.URL{
+		Scheme: "https",
+		Host:   "petpic.xyz",
+		Path:   "/earth/brasil/rio",
+	}
+
 	var fixtures = []filePathFixture{
 		{pathlessURL, "", true, "", "index.html"},
 		{pathlessURL, "#contents", true, "", "#contents"},
 		{URL, "brasil/index.html", true, "", "brasil/index.html"},
 		{URL, "brasil/rio/index.html", true, "", "brasil/rio/index.html"},
 		{URL, "../argentina/cat.jpg", false, "", "../argentina/cat.jpg"},
+		// Task #4 regression: root href "/" from a subdir page must resolve
+		// to the on-disk root index, NOT to a sibling under the current dir.
+		{subdirPage, "/", true, "", "../index.html"},
+		// Query is intentionally dropped from the on-disk path; the link
+		// still points at the rewritten root index file.
+		{subdirPage, "/?q=1", true, "", "../index.html"},
+		// Multi-level depth: page at /earth/brasil/rio → root needs "../../".
+		{deeperPage, "/", true, "", "../../index.html"},
 	}
 
 	for _, fix := range fixtures {

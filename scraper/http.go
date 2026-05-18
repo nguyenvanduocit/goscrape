@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/cornelk/gotokit/app"
@@ -144,7 +146,30 @@ func (s *Scraper) requestWithRetry(ctx context.Context, u *url.URL) (*http.Respo
 	for attempt := range maxRetries + 1 {
 		resp, err := s.downloadURL(ctx, u)
 		if err != nil {
-			return nil, err
+			// If the caller's context is canceled or its deadline expired,
+			// the error chain may carry context.DeadlineExceeded even when
+			// it was actually triggered by http.Client.Timeout (which is a
+			// SEPARATE per-request budget). Decide based on ctx, not err,
+			// so a true caller-side abort short-circuits and a client-side
+			// timeout still gets retried.
+			if ctx.Err() != nil {
+				return nil, err
+			}
+			if !isRetryableNetworkError(err) {
+				return nil, err
+			}
+			if attempt == maxRetries {
+				return nil, fmt.Errorf("%w for URL %s: %w", errExhaustedRetries, u, err)
+			}
+			s.logger.Warn("Retryable network error. Retrying",
+				log.Int("attempt", attempt+1),
+				log.Int("max", maxRetries),
+				log.String("url", u.String()),
+				log.Err(err))
+			if sleepErr := s.sleepBeforeRetry(ctx, attempt, ""); sleepErr != nil {
+				return nil, sleepErr
+			}
+			continue
 		}
 		if !retryableStatusCodes[resp.StatusCode] {
 			return resp, nil
@@ -163,17 +188,74 @@ func (s *Scraper) requestWithRetry(ctx context.Context, u *url.URL) (*http.Respo
 			log.Int("max", maxRetries),
 			log.String("url", u.String()))
 
-		sleep := time.Duration(attempt+1) * retryDelay
-		sleep += time.Duration(rand.Int64N(int64(retryDelay))) // 0 to retryDelay jitter
-		if ra := parseRetryAfter(retryAfterHeader); ra > 0 {
-			sleep = ra // honor server signal verbatim, no jitter
-		}
-		if err := app.Sleep(ctx, sleep); err != nil {
-			return nil, fmt.Errorf("sleeping between retries: %w", err)
+		if sleepErr := s.sleepBeforeRetry(ctx, attempt, retryAfterHeader); sleepErr != nil {
+			return nil, sleepErr
 		}
 	}
 	// Unreachable: the loop either returns on success or on retry exhaustion.
 	return nil, fmt.Errorf("%w for URL %s", errExhaustedRetries, u)
+}
+
+// sleepBeforeRetry sleeps with linear backoff + jitter between retry attempts.
+// When retryAfterHeader is non-empty and parses to a positive duration, that
+// value is honored verbatim (no jitter) — server-supplied signals take
+// precedence over our local backoff.
+func (s *Scraper) sleepBeforeRetry(ctx context.Context, attempt int, retryAfterHeader string) error {
+	sleep := time.Duration(attempt+1) * retryDelay
+	sleep += time.Duration(rand.Int64N(int64(retryDelay))) // 0 to retryDelay jitter
+	if ra := parseRetryAfter(retryAfterHeader); ra > 0 {
+		sleep = ra
+	}
+	if err := app.Sleep(ctx, sleep); err != nil {
+		return fmt.Errorf("sleeping between retries: %w", err)
+	}
+	return nil
+}
+
+// isRetryableNetworkError reports whether an error returned by http.Client.Do
+// represents a transient network failure worth retrying. Caller-context
+// cancellation is NOT handled here — requestWithRetry checks ctx.Err()
+// directly so it can distinguish a true caller abort from an http.Client
+// per-request Timeout (which also surfaces context.DeadlineExceeded in the
+// error chain but should be retried).
+//
+// Returns false for SSRF block (sentinel), DNS NXDOMAIN (host doesn't
+// exist), and unknown errors. Returns true for timeouts, connection
+// resets/refused, network/host unreachable, EOF/short reads, and DNS
+// soft failures.
+func isRetryableNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrBlockedPrivateAddress) {
+		return false
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		if dnsErr.IsNotFound {
+			return false
+		}
+		if dnsErr.IsTimeout || dnsErr.IsTemporary {
+			return true
+		}
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	switch {
+	case errors.Is(err, io.EOF),
+		errors.Is(err, io.ErrUnexpectedEOF),
+		errors.Is(err, syscall.ECONNRESET),
+		errors.Is(err, syscall.ECONNREFUSED),
+		errors.Is(err, syscall.ECONNABORTED),
+		errors.Is(err, syscall.ETIMEDOUT),
+		errors.Is(err, syscall.EHOSTUNREACH),
+		errors.Is(err, syscall.ENETUNREACH),
+		errors.Is(err, syscall.EPIPE):
+		return true
+	}
+	return false
 }
 
 // checkResponseStatus returns an HTTPStatusError for non-200 responses,

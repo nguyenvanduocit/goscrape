@@ -115,13 +115,15 @@ func (s *Scraper) downloadAsset(ctx context.Context, u *url.URL, processor asset
 // body to file, emit lifecycle events.
 func (s *Scraper) streamAssetToDisk(ctx context.Context, u *url.URL, urlFull, filePath string) error {
 	if err := s.dirCreator(filepath.Dir(filePath)); err != nil {
+		wrapped := fmt.Errorf("creating asset directory %q: %w", filepath.Dir(filePath), err)
 		s.logger.Error("Creating asset directory failed",
 			log.String("url", urlFull),
 			log.String("dir", filepath.Dir(filePath)),
 			log.Err(err))
-		s.addFailedURL(urlFull, err)
-		s.emit(Event{Kind: EventFailed, URL: urlFull, Err: err.Error()})
-		return fmt.Errorf("creating asset directory: %w", err)
+		s.unmarkURLProcessed(u)
+		s.addFailedURL(urlFull, wrapped)
+		s.emit(Event{Kind: EventFailed, URL: urlFull, Err: wrapped.Error()})
+		return wrapped
 	}
 	if _, err := s.httpStreamer(ctx, u, filePath); err != nil {
 		return s.handleAssetDownloadError(u, urlFull, err)
@@ -142,10 +144,15 @@ func (s *Scraper) bufferAndProcessAsset(ctx context.Context, u *url.URL, urlFull
 	data = processor(u, data)
 
 	if err = s.fileWriter(filePath, data); err != nil {
+		wrapped := fmt.Errorf("writing asset file %q: %w", filePath, err)
 		s.logger.Error("Writing asset file failed",
 			log.String("url", urlFull),
 			log.String("file", filePath),
 			log.Err(err))
+		s.unmarkURLProcessed(u)
+		s.addFailedURL(urlFull, wrapped)
+		s.emit(Event{Kind: EventFailed, URL: urlFull, Err: wrapped.Error()})
+		return wrapped
 	}
 
 	s.incrementProgress()
@@ -177,42 +184,8 @@ func (s *Scraper) cssProcessor(baseURL *url.URL, data []byte) []byte {
 	urls := make(map[string]string)
 	var discovered []*url.URL
 
-	// Calculate relative path prefix for external CSS files
-	// For CSS at _external.com/path/file.css, we need to go up to website root
-	var relativePrefix string
-	if baseURL.Host != s.URL.Host {
-		// External CSS: count directory levels in URL path (excluding filename)
-		cssPath := baseURL.Path
-		if cssPath == "" || cssPath == "/" {
-			cssPath = "/"
-		}
-		// Count directory levels to go up: 1 for the file's directory + 1 for the _hostname directory
-		pathDir := path.Dir(cssPath)
-		levelsUp := 1
-		if pathDir != "/" && pathDir != "." {
-			levelsUp += strings.Count(pathDir, "/")
-		}
-		relativePrefix = strings.Repeat("../", levelsUp)
-	}
-
-	processor := func(token *css.Token, urlStr string, u *url.URL) {
-		// Skip external URLs if configured
-		if s.config.SkipExternalResources && u.Host != "" && u.Host != s.URL.Host {
-			return
-		}
-		discovered = append(discovered, u)
-
-		// Resolve URL relative to CSS file location (baseURL)
-		resolved := resolveURL(baseURL, urlStr, s.URL.Host, false, "", s.config.SkipExternalResources, s.allowedCDN)
-
-		// For external CSS files, prepend relative path to root
-		if baseURL.Host != s.URL.Host && !strings.HasPrefix(resolved, "../") {
-			resolved = relativePrefix + resolved
-		}
-
-		// token.Value is already "url(...)", so we map it to a new url('...')
-		urls[token.Value] = "url('" + resolved + "')"
-	}
+	relativePrefix := externalCSSRelativePrefix(baseURL, s.URL.Host)
+	processor := s.makeCSSProcessor(baseURL, relativePrefix, urls, &discovered)
 
 	cssData := string(data)
 	css.Process(s.logger, baseURL, cssData, processor)
@@ -235,6 +208,57 @@ func (s *Scraper) cssProcessor(baseURL *url.URL, data []byte) []byte {
 	}
 
 	return []byte(cssData)
+}
+
+// externalCSSRelativePrefix computes how many "../" segments are needed to
+// climb from an external CSS file's on-disk location back up to the root of
+// the local mirror. Returns "" when the CSS lives on the same host as the
+// main scrape target (no climbing needed).
+func externalCSSRelativePrefix(baseURL *url.URL, mainHost string) string {
+	if baseURL.Host == mainHost {
+		return ""
+	}
+	cssPath := baseURL.Path
+	if cssPath == "" {
+		cssPath = "/"
+	}
+	pathDir := path.Dir(cssPath)
+	levelsUp := 1 // climb out of the _hostname directory
+	if pathDir != "/" && pathDir != "." {
+		levelsUp += strings.Count(pathDir, "/")
+	}
+	return strings.Repeat("../", levelsUp)
+}
+
+// makeCSSProcessor returns the per-URL callback wired into css.Process. It
+// classifies each token (url(...) vs bare-string @import), resolves its
+// target to a mirror-relative path, and records the rewrite in the urls map.
+// Discovered absolute URLs are appended to *discovered for later enqueueing.
+func (s *Scraper) makeCSSProcessor(baseURL *url.URL, relativePrefix string,
+	urls map[string]string, discovered *[]*url.URL) func(*css.Token, string, *url.URL) {
+
+	return func(token *css.Token, urlStr string, u *url.URL) {
+		if s.config.SkipExternalResources && u.Host != "" && u.Host != s.URL.Host {
+			return
+		}
+		*discovered = append(*discovered, u)
+
+		resolved := resolveURL(baseURL, urlStr, s.URL.Host, false, "", s.config.SkipExternalResources, s.allowedCDN)
+		if baseURL.Host != s.URL.Host && !strings.HasPrefix(resolved, "../") {
+			resolved = relativePrefix + resolved
+		}
+
+		// token.Value is either the literal "url(...)" form OR — for bare-string
+		// @import — the full "@import \"x.css\"" pattern carrying its at-keyword
+		// prefix so the replacement is uniquely-anchored and doesn't collide
+		// with unrelated `"x.css"` strings (e.g. content: "x.css").
+		switch css.Kind(token) {
+		case css.KindURL:
+			urls[token.Value] = "url('" + resolved + "')"
+		case css.KindImportString:
+			urls[token.Value] = "@import url('" + resolved + "')"
+		}
+	}
 }
 
 // jsAssetExtensions lists file extensions to look for in JavaScript files.

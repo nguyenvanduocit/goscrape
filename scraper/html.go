@@ -140,15 +140,25 @@ func (s *Scraper) fixStyleTagURL(baseURL *url.URL, node *html.Node,
 	}
 
 	urls := map[string]string{}
+	importReplacements := map[string]string{}
 
-	processor := func(_ *css.Token, before string, u *url.URL) {
+	processor := func(token *css.Token, before string, u *url.URL) {
 		// Skip external URLs if configured
 		if s.config.SkipExternalResources && u != nil && u.Host != "" && u.Host != s.URL.Host {
 			return
 		}
 		adjusted := resolveURL(baseURL, before, s.URL.Host, isHyperlink, relativeToRoot, s.config.SkipExternalResources, s.allowedCDN, s.pageExtension())
-		if before != adjusted {
+		if before == adjusted {
+			return
+		}
+		switch css.Kind(token) {
+		case css.KindURL:
 			urls[before] = adjusted
+		case css.KindImportString:
+			// token.Value carries the full "@import \"x.css\"" source pattern;
+			// replace it as a whole so we don't collide with unrelated CSS
+			// string literals.
+			importReplacements[token.Value] = "@import url('" + adjusted + "')"
 		}
 	}
 
@@ -162,6 +172,13 @@ func (s *Scraper) fixStyleTagURL(baseURL *url.URL, node *html.Node,
 		s.logger.Debug("CSS Element relinked",
 			log.String("url", before),
 			log.String("fixed_url", filePath))
+		changed = true
+	}
+	for pattern, replacement := range importReplacements {
+		cssData = strings.ReplaceAll(cssData, pattern, replacement)
+		s.logger.Debug("CSS @import relinked",
+			log.String("pattern", pattern),
+			log.String("replacement", replacement))
 		changed = true
 	}
 
@@ -180,9 +197,15 @@ func (s *Scraper) fixInlineStyleURL(baseURL *url.URL, node *html.Node, relativeT
 
 		urls := map[string]string{}
 
-		processor := func(_ *css.Token, before string, u *url.URL) {
+		processor := func(token *css.Token, before string, u *url.URL) {
 			// Skip external URLs if configured
 			if s.config.SkipExternalResources && u != nil && u.Host != "" && u.Host != s.URL.Host {
+				return
+			}
+			// CSS @import is not valid inside an HTML inline style attribute,
+			// so silently ignore any bare-string import the parser surfaces
+			// here rather than producing a malformed rewrite.
+			if css.Kind(token) == css.KindImportString {
 				return
 			}
 			adjusted := resolveURL(baseURL, before, s.URL.Host, false, relativeToRoot, s.config.SkipExternalResources, s.allowedCDN, s.pageExtension())

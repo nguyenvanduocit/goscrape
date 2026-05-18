@@ -111,10 +111,12 @@ func TestGetPageFilePathWithExt(t *testing.T) {
 		ext      string
 		expected string
 	}{
-		{"root html", "/", ".html", "index.html"},
-		{"root md", "/", ".md", "index.md"},
-		{"empty html", "", ".html", "index.html"},
-		{"empty md", "", ".md", "index.md"},
+		// Root paths preserve their leading slash so URL rewriting can treat
+		// them as absolute (see Task #4: root-link rewrite regression).
+		{"root html", "/", ".html", "/index.html"},
+		{"root md", "/", ".md", "/index.md"},
+		{"empty html", "", ".html", "/index.html"},
+		{"empty md", "", ".md", "/index.md"},
 		{"dir html", "/about/", ".html", "/about/index.html"},
 		{"dir md", "/about/", ".md", "/about/index.md"},
 		{"no ext html", "/about", ".html", "/about.html"},
@@ -253,7 +255,7 @@ func TestMarkdownStoreDownload(t *testing.T) {
 
 	// htmlindex is needed but we can pass a nil-safe one
 	idx := newTestIndex(t, u, doc)
-	s.storeDownload(u, []byte(htmlContent), doc, idx, "")
+	require.NoError(t, s.storeDownload(u, []byte(htmlContent), doc, idx, ""))
 
 	assert.True(t, strings.HasSuffix(writtenPath, "page.md"), "expected .md path, got: %s", writtenPath)
 	assert.Contains(t, string(writtenData), "# Test Page")
