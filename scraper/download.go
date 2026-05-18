@@ -223,7 +223,7 @@ func (s *Scraper) cssProcessor(baseURL *url.URL, data []byte) []byte {
 		return data
 	}
 
-	var cssReplacerPairs []string
+	cssReplacerPairs := make([]string, 0, len(urls)*2)
 	for ori, fixed := range urls {
 		cssReplacerPairs = append(cssReplacerPairs, ori, fixed)
 		s.logger.Debug("CSS Element relinked",
@@ -336,45 +336,68 @@ func (s *Scraper) jsProcessor(baseURL *url.URL, data []byte) []byte {
 
 	jsData := string(data)
 	urls := make(map[string]string)
-	var discovered []*url.URL
 	skipExternal := s.config.SkipExternalResources
 
-	patterns := []*regexp.Regexp{
-		jsLocalPathPattern,
-		jsExternalPathPattern,
-	}
-
-	discovered = append(discovered, findDirFileCombinations(jsData, baseURL, s.URL.Host, urls, skipExternal, s.allowedCDN)...)
-
-	for _, pattern := range patterns {
-		for _, match := range pattern.FindAllStringSubmatch(jsData, -1) {
-			if len(match) < 2 {
-				continue
-			}
-			src := match[1]
-			if strings.HasPrefix(src, "data:") || urls[src] != "" {
-				continue
-			}
-			u, err := baseURL.Parse(src)
-			if err != nil {
-				s.logger.Debug("Failed to parse URL in JS", log.String("url", src), log.Err(err))
-				continue
-			}
-			if skipExternal && u.Host != "" && u.Host != s.URL.Host {
-				continue
-			}
-			discovered = append(discovered, u)
-			urls[src] = resolveURL(baseURL, src, s.URL.Host, false, "", skipExternal, s.allowedCDN)
-		}
-	}
-
+	discovered := findDirFileCombinations(jsData, baseURL, s.URL.Host, urls, skipExternal, s.allowedCDN)
+	discovered = append(discovered, s.extractJSPatternURLs(baseURL, jsData, urls, skipExternal)...)
 	s.enqueueAssets(discovered)
 
-	// Rewrite same-domain absolute base URLs (e.g., "https://www.example.com/path/")
-	// to relative paths (e.g., "/path/"). These are used by JS for dynamic URL construction.
-	// Check both http and https since the initial URL scheme may differ from what JS uses.
+	markJSMainBaseRewrites(jsData, urls, s.URL.Host)
+
+	jsData = s.applyJSReplacements(jsData, urls)
+	if !skipExternal {
+		jsData = s.rewriteCDNBases(jsData)
+	}
+	return []byte(jsData)
+}
+
+// extractJSPatternURLs walks the local + external regex patterns over jsData,
+// records discovered asset URLs into urls (src → resolved), and returns the
+// matched URLs for downstream enqueueing.
+func (s *Scraper) extractJSPatternURLs(baseURL *url.URL, jsData string, urls map[string]string, skipExternal bool) []*url.URL {
+	var discovered []*url.URL
+	for _, pattern := range []*regexp.Regexp{jsLocalPathPattern, jsExternalPathPattern} {
+		for _, match := range pattern.FindAllStringSubmatch(jsData, -1) {
+			if u, src, ok := s.classifyJSMatch(baseURL, match, urls, skipExternal); ok {
+				discovered = append(discovered, u)
+				urls[src] = resolveURL(baseURL, src, s.URL.Host, false, "", skipExternal, s.allowedCDN)
+			}
+		}
+	}
+	return discovered
+}
+
+// classifyJSMatch validates a single regex match: must have a capture
+// group, not a data URI, not already mapped, parseable against baseURL,
+// and (when skipExternal is set) on the main host.
+func (s *Scraper) classifyJSMatch(baseURL *url.URL, match []string, urls map[string]string, skipExternal bool) (*url.URL, string, bool) {
+	if len(match) < 2 {
+		return nil, "", false
+	}
+	src := match[1]
+	if strings.HasPrefix(src, "data:") || urls[src] != "" {
+		return nil, "", false
+	}
+	u, err := baseURL.Parse(src)
+	if err != nil {
+		s.logger.Debug("Failed to parse URL in JS", log.String("url", src), log.Err(err))
+		return nil, "", false
+	}
+	if skipExternal && u.Host != "" && u.Host != s.URL.Host {
+		return nil, "", false
+	}
+	return u, src, true
+}
+
+// markJSMainBaseRewrites records same-domain absolute base URLs (e.g.
+// `"https://www.example.com`) for replacement with their quoting char so
+// JS that builds URLs dynamically falls back to relative paths.
+//
+// Both http and https are checked because the JS may use a different
+// scheme than the page that loaded it.
+func markJSMainBaseRewrites(jsData string, urls map[string]string, mainHost string) {
 	for _, scheme := range []string{"https", "http"} {
-		mainBase := scheme + "://" + s.URL.Host
+		mainBase := scheme + "://" + mainHost
 		for _, quote := range []string{`"`, `'`, "`"} {
 			prefix := quote + mainBase
 			if strings.Contains(jsData, prefix) {
@@ -382,23 +405,23 @@ func (s *Scraper) jsProcessor(baseURL *url.URL, data []byte) []byte {
 			}
 		}
 	}
+}
 
-	var jsReplacerPairs []string
+// applyJSReplacements collapses the urls map into a single NewReplacer
+// pass over jsData. Pairs where the target equals the source are ignored.
+func (s *Scraper) applyJSReplacements(jsData string, urls map[string]string) string {
+	jsReplacerPairs := make([]string, 0, len(urls)*2)
 	for ori, filePath := range urls {
-		if ori != filePath {
-			jsReplacerPairs = append(jsReplacerPairs, ori, filePath)
-			s.logger.Debug("JS URL relinked", log.String("url", ori), log.String("fixed_url", filePath))
+		if ori == filePath {
+			continue
 		}
+		jsReplacerPairs = append(jsReplacerPairs, ori, filePath)
+		s.logger.Debug("JS URL relinked", log.String("url", ori), log.String("fixed_url", filePath))
 	}
-	if len(jsReplacerPairs) > 0 {
-		jsData = strings.NewReplacer(jsReplacerPairs...).Replace(jsData)
+	if len(jsReplacerPairs) == 0 {
+		return jsData
 	}
-
-	if !skipExternal {
-		jsData = s.rewriteCDNBases(jsData)
-	}
-
-	return []byte(jsData)
+	return strings.NewReplacer(jsReplacerPairs...).Replace(jsData)
 }
 
 // enqueueAssets submits discovered asset URLs to the unified task queue.

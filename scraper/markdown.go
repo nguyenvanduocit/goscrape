@@ -148,7 +148,7 @@ func replaceAutolinks(line string) string {
 // Fenced code blocks (``` or ~~~) are preserved verbatim.
 func cleanupMarkdown(md []byte) []byte {
 	lines := strings.Split(string(md), "\n")
-	var out []string
+	out := make([]string, 0, len(lines))
 
 	inFence := false
 	fenceMarker := ""

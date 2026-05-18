@@ -9,7 +9,6 @@ import (
 	"github.com/cornelk/gotokit/set"
 )
 
-// nolint: cyclop
 func resolveURL(base *url.URL, reference, mainPageHost string, isHyperlink bool, relativeToRoot string, skipExternal bool, allowedCDN set.Set[string], pageExt ...string) string {
 	ext := PageExtension
 	if len(pageExt) > 0 && pageExt[0] != "" {
@@ -20,23 +19,9 @@ func resolveURL(base *url.URL, reference, mainPageHost string, isHyperlink bool,
 		return ""
 	}
 
-	var resolvedURL *url.URL
-	if ur.Host != "" && ur.Host != mainPageHost {
-		// Check if this external host is in the allowed CDN list
-		isAllowedCDN := allowedCDN != nil && allowedCDN.Contains(ur.Host)
-
-		if isHyperlink || (skipExternal && !isAllowedCDN) {
-			// do not change links to external websites or external assets when skipping
-			return reference
-		}
-
-		resolvedURL = base.ResolveReference(ur)
-		resolvedURL.Path = filepath.Join("_"+sanitizeHostForPath(ur.Host), resolvedURL.Path)
-	} else {
-		if isHyperlink {
-			ur.Path = getPageFilePathWithExt(ur, ext)
-		}
-		resolvedURL = base.ResolveReference(ur)
+	resolvedURL, keep := resolveAgainstBase(base, ur, mainPageHost, isHyperlink, skipExternal, allowedCDN, ext)
+	if keep {
+		return reference
 	}
 
 	if resolvedURL.Host == mainPageHost {
@@ -51,45 +36,82 @@ func resolveURL(base *url.URL, reference, mainPageHost string, isHyperlink bool,
 	resolvedURL.Host = ""   // remove host
 	resolvedURL.Scheme = "" // remove http/https
 
-	// Handle CDN concatenation URLs (e.g., /path/??file1.js,file2.js)
-	// where ?? is parsed as query string. Incorporate first filename into path.
-	if strings.HasPrefix(resolvedURL.RawQuery, "?") {
-		query := strings.TrimPrefix(resolvedURL.RawQuery, "?")
-		if files := strings.SplitN(query, ",", 2); len(files) > 0 && files[0] != "" {
-			resolvedURL.Path = path.Join(resolvedURL.Path, files[0])
-		}
-	}
-
-	resolvedURL.RawQuery = "" // remove query string - files are saved without it
+	applyCDNConcatQuery(resolvedURL)
+	resolvedURL.RawQuery = "" // files are saved without query string
 	resolvedURL.ForceQuery = false
+
 	resolved := resolvedURL.Path
 	if resolvedURL.Fragment != "" {
 		resolved += "#" + resolvedURL.Fragment
 	}
-
-	if resolved == "" {
-		resolved = "/" // website root
-	} else {
-		if resolved[0] == '/' && len(relativeToRoot) > 0 {
-			resolved = relativeToRoot + resolved[1:]
-		} else {
-			resolved = relativeToRoot + resolved
-		}
-	}
+	resolved = applyRelativeToRoot(resolved, relativeToRoot)
 
 	if isHyperlink {
-		dirIndex := "index" + ext
-		if resolved[len(resolved)-1] == '/' {
-			resolved += dirIndex
-		} else {
-			l := strings.LastIndexByte(resolved, '/')
-			if l != -1 && l < len(resolved) && resolved[l+1] == '#' {
-				resolved = resolved[:l+1] + dirIndex + resolved[l+1:]
-			}
-		}
+		resolved = applyHyperlinkSuffix(resolved, ext)
 	}
+	return strings.TrimPrefix(resolved, "/")
+}
 
-	resolved = strings.TrimPrefix(resolved, "/")
+// resolveAgainstBase classifies the reference (external vs same-host) and
+// resolves it relative to base. Returns (resolvedURL, keepOriginal):
+// keepOriginal=true means the caller should return the raw reference
+// unchanged (external links or external assets when SkipExternalResources).
+func resolveAgainstBase(base, ur *url.URL, mainPageHost string, isHyperlink, skipExternal bool, allowedCDN set.Set[string], ext string) (*url.URL, bool) {
+	isExternal := ur.Host != "" && ur.Host != mainPageHost
+	if isExternal {
+		isAllowedCDN := allowedCDN != nil && allowedCDN.Contains(ur.Host)
+		if isHyperlink || (skipExternal && !isAllowedCDN) {
+			return nil, true
+		}
+		resolved := base.ResolveReference(ur)
+		resolved.Path = filepath.Join("_"+sanitizeHostForPath(ur.Host), resolved.Path)
+		return resolved, false
+	}
+	if isHyperlink {
+		ur.Path = getPageFilePathWithExt(ur, ext)
+	}
+	return base.ResolveReference(ur), false
+}
+
+// applyCDNConcatQuery rewrites CDN concat URLs (e.g. "/path/??file1.js,file2.js")
+// where "??" is parsed as a query string, by folding the first filename
+// into the path so it maps cleanly onto disk.
+func applyCDNConcatQuery(u *url.URL) {
+	if !strings.HasPrefix(u.RawQuery, "?") {
+		return
+	}
+	query := strings.TrimPrefix(u.RawQuery, "?")
+	files := strings.SplitN(query, ",", 2)
+	if len(files) == 0 || files[0] == "" {
+		return
+	}
+	u.Path = path.Join(u.Path, files[0])
+}
+
+// applyRelativeToRoot prepends the relativeToRoot prefix to a resolved
+// path, treating the empty path as the website root.
+func applyRelativeToRoot(resolved, relativeToRoot string) string {
+	if resolved == "" {
+		return "/"
+	}
+	if resolved[0] == '/' && len(relativeToRoot) > 0 {
+		return relativeToRoot + resolved[1:]
+	}
+	return relativeToRoot + resolved
+}
+
+// applyHyperlinkSuffix appends index<ext> when a hyperlink resolves to a
+// directory or to a fragment alone, so the saved filename matches the
+// on-disk page convention.
+func applyHyperlinkSuffix(resolved, ext string) string {
+	dirIndex := "index" + ext
+	if resolved[len(resolved)-1] == '/' {
+		return resolved + dirIndex
+	}
+	l := strings.LastIndexByte(resolved, '/')
+	if l != -1 && l < len(resolved) && resolved[l+1] == '#' {
+		return resolved[:l+1] + dirIndex + resolved[l+1:]
+	}
 	return resolved
 }
 

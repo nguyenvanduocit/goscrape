@@ -426,73 +426,21 @@ func (s *Scraper) processURL(ctx context.Context, u *url.URL, currentDepth uint)
 	s.logger.Info("Downloading webpage", log.String("url", u.String()))
 	s.emit(Event{Kind: EventPageStart, URL: u.String(), Depth: currentDepth})
 
-	// Skip download if the target file already exists on disk.
-	// Cached files have their URL references rewritten to local paths, so
-	// re-parsing them would yield invalid URLs. We skip children entirely.
-	if s.config.SkipExisting {
-		filePath := s.getFilePath(u, true)
-		if s.fileExistenceCheck(filePath) {
-			s.logger.Debug("Skipping existing page",
-				log.String("url", u.String()),
-				log.String("file", filePath))
-			s.incrementProgress()
-			s.emit(Event{Kind: EventSkipped, URL: u.String(), Message: "existing on disk", Depth: currentDepth})
-			return nil
-		}
+	if s.skipIfPageCached(u, currentDepth) {
+		return nil
 	}
 
 	data, respURL, err := s.httpDownloader(ctx, u)
 	if err != nil {
-		// 403 on a web page is typically a permanent denial (auth-gated, special pages).
-		// Record it and continue crawling instead of aborting — unless it is the
-		// start page (depth 0), where a 403 means the entire scrape is invalid.
-		if IsHTTPStatusError(err, http.StatusForbidden) {
-			s.addFailedURL(u.String(), err)
-			s.incrementProgress()
-			if currentDepth == 0 {
-				return fmt.Errorf("start page returned 403 Forbidden: %s", u.String())
-			}
-			s.logger.Warn("HTTP 403 on webpage, skipping",
-				log.String("url", u.String()))
-			s.emit(Event{Kind: EventFailed, URL: u.String(), Err: "403 Forbidden", Depth: currentDepth})
-			return nil
-		}
-		s.logger.Error("Processing HTTP Request failed",
-			log.String("url", u.String()),
-			log.Err(err))
-		s.emit(Event{Kind: EventFailed, URL: u.String(), Err: err.Error(), Depth: currentDepth})
-		return err
+		return s.handlePageDownloadError(u, currentDepth, err)
 	}
 
-	fileExtension := ""
-	kind, err := filetype.Match(data)
-	if err == nil && kind != types.Unknown {
-		fileExtension = kind.Extension
-	}
-
+	fileExtension := detectFileExtension(data)
 	if currentDepth == 0 {
-		// If the start page was redirected, the URL that emit'd the
-		// EventPageDiscovered/Start events differs from the URL that
-		// will own the children. Announce the redirected URL as
-		// discovered so the TUI tree threads correctly: child pages
-		// emit Parent = u.String() against the post-redirect URL.
-		if respURL != nil && respURL.String() != u.String() {
-			s.emit(Event{
-				Kind:    EventPageDiscovered,
-				URL:     respURL.String(),
-				Parent:  u.String(),
-				Depth:   0,
-				Message: "redirected from start URL",
-			})
-		}
-		u = respURL
-		// use the URL that the website returned as new base url for the
-		// scrape, in case of a redirect it changed
-		s.URL = u
+		u = s.adoptStartPageRedirect(u, respURL)
 	}
 
-	buf := bytes.NewBuffer(data)
-	doc, err := html.Parse(buf)
+	doc, err := html.Parse(bytes.NewBuffer(data))
 	if err != nil {
 		s.logger.Error("Parsing HTML failed",
 			log.String("url", u.String()),
@@ -504,45 +452,121 @@ func (s *Scraper) processURL(ctx context.Context, u *url.URL, currentDepth uint)
 	index.Index(u, doc)
 
 	s.storeDownload(u, data, doc, index, fileExtension)
-
 	s.submitReferences(index)
 
-	// check first and download afterward to not hit max depth limit for
-	// start page links because of recursive linking
-	// a hrefs
+	if s.queueChildPages(index, u, currentDepth) {
+		s.emitQueueChanged()
+	}
+	s.emit(Event{Kind: EventPageDone, URL: u.String(), Depth: currentDepth})
+	return nil
+}
+
+// skipIfPageCached returns true when --skip-existing is set and the page's
+// target file already exists on disk. Emits the skipped event so consumers
+// see the lifecycle close.
+//
+// Cached files have their URL references rewritten to local paths, so
+// re-parsing them would yield invalid URLs — children are skipped entirely.
+func (s *Scraper) skipIfPageCached(u *url.URL, currentDepth uint) bool {
+	if !s.config.SkipExisting {
+		return false
+	}
+	filePath := s.getFilePath(u, true)
+	if !s.fileExistenceCheck(filePath) {
+		return false
+	}
+	s.logger.Debug("Skipping existing page",
+		log.String("url", u.String()),
+		log.String("file", filePath))
+	s.incrementProgress()
+	s.emit(Event{Kind: EventSkipped, URL: u.String(), Message: "existing on disk", Depth: currentDepth})
+	return true
+}
+
+// handlePageDownloadError translates a download error into a per-depth
+// outcome: at depth 0 a 403 aborts the scrape; deeper, 403 is recorded
+// and crawling continues. Any other error is logged and propagated.
+func (s *Scraper) handlePageDownloadError(u *url.URL, currentDepth uint, err error) error {
+	if IsHTTPStatusError(err, http.StatusForbidden) {
+		s.addFailedURL(u.String(), err)
+		s.incrementProgress()
+		if currentDepth == 0 {
+			return fmt.Errorf("start page returned 403 Forbidden: %s", u.String())
+		}
+		s.logger.Warn("HTTP 403 on webpage, skipping", log.String("url", u.String()))
+		s.emit(Event{Kind: EventFailed, URL: u.String(), Err: "403 Forbidden", Depth: currentDepth})
+		return nil
+	}
+	s.logger.Error("Processing HTTP Request failed",
+		log.String("url", u.String()),
+		log.Err(err))
+	s.emit(Event{Kind: EventFailed, URL: u.String(), Err: err.Error(), Depth: currentDepth})
+	return err
+}
+
+// adoptStartPageRedirect rewrites the scraper's base URL when the start
+// page returned a redirect. Announces the post-redirect URL as discovered
+// so TUI consumers thread children under the right parent.
+func (s *Scraper) adoptStartPageRedirect(original, respURL *url.URL) *url.URL {
+	if respURL == nil {
+		return original
+	}
+	if respURL.String() != original.String() {
+		s.emit(Event{
+			Kind:    EventPageDiscovered,
+			URL:     respURL.String(),
+			Parent:  original.String(),
+			Depth:   0,
+			Message: "redirected from start URL",
+		})
+	}
+	s.URL = respURL
+	return respURL
+}
+
+// queueChildPages submits every <a> href that should be crawled and emits
+// a discovery edge per submission. Returns true if at least one task was
+// queued (caller emits the queue-change event in that case).
+//
+// Check-and-submit happens first; download is async — see scraper.Start.
+// The MaxDepth check fires inside shouldURLBeDownloaded, so we don't need
+// to gate the loop here.
+func (s *Scraper) queueChildPages(index *htmlindex.Index, parent *url.URL, currentDepth uint) bool {
 	references, err := index.URLs(htmlindex.ATag)
 	if err != nil {
 		s.logger.Error("Parsing URL failed", log.Err(err))
 	}
-
 	queued := false
 	for _, ur := range references {
 		ur.Fragment = ""
-
-		if s.shouldURLBeDownloaded(ur, currentDepth, false) {
-			s.queue.submit(task{
-				kind:   taskPage,
-				url:    ur,
-				depth:  currentDepth + 1,
-				parent: u.String(),
-			})
-			queued = true
-			// Record the discovery edge so the TUI can render the
-			// crawl as a tree.
-			s.emit(Event{
-				Kind:   EventPageDiscovered,
-				URL:    ur.String(),
-				Parent: u.String(),
-				Depth:  currentDepth + 1,
-			})
+		if !s.shouldURLBeDownloaded(ur, currentDepth, false) {
+			continue
 		}
+		s.queue.submit(task{
+			kind:   taskPage,
+			url:    ur,
+			depth:  currentDepth + 1,
+			parent: parent.String(),
+		})
+		queued = true
+		s.emit(Event{
+			Kind:   EventPageDiscovered,
+			URL:    ur.String(),
+			Parent: parent.String(),
+			Depth:  currentDepth + 1,
+		})
 	}
+	return queued
+}
 
-	s.emit(Event{Kind: EventPageDone, URL: u.String(), Depth: currentDepth})
-	if queued {
-		s.emitQueueChanged()
+// detectFileExtension classifies the downloaded bytes via magic-number
+// matching. Returns "" if the type is unknown (HTML/text/etc.).
+func detectFileExtension(data []byte) string {
+	kind, err := filetype.Match(data)
+	if err != nil || kind == types.Unknown {
+		return ""
 	}
-	return nil
+	return kind.Extension
 }
 
 // storeDownload writes the download to a file, if a known binary file is detected,

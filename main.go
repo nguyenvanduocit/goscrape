@@ -199,30 +199,46 @@ func runScraper(ctx context.Context, args arguments, logger *log.Logger) error {
 
 	applyProfile(&args)
 
-	var username, password string
-	if args.User != "" {
-		sl := strings.SplitN(args.User, ":", 2)
-		username = sl[0]
-		if len(sl) > 1 {
-			password = sl[1]
-		}
-	}
-
-	imageQuality := args.ImageQuality
-	if args.ImageQuality < 0 || args.ImageQuality > 100 {
-		imageQuality = 0
-	}
-
 	cookies, err := readCookieFile(args.CookieFile)
 	if err != nil {
 		return fmt.Errorf("reading cookie: %w", err)
 	}
 
-	cfg := scraper.Config{
+	cfg := buildScraperConfig(args, cookies)
+	return scrapeURLs(ctx, cfg, logger, args)
+}
+
+// splitUserPassword splits "user[:password]" into its two parts. An empty
+// input returns ("", "").
+func splitUserPassword(user string) (string, string) {
+	if user == "" {
+		return "", ""
+	}
+	sl := strings.SplitN(user, ":", 2)
+	if len(sl) == 1 {
+		return sl[0], ""
+	}
+	return sl[0], sl[1]
+}
+
+// clampImageQuality keeps imagequality in [0, 100]; values outside that
+// range disable re-encoding (treated as 0).
+func clampImageQuality(q int64) uint {
+	if q < 0 || q > 100 {
+		return 0
+	}
+	return uint(q)
+}
+
+// buildScraperConfig assembles the scraper.Config from parsed CLI args.
+// Kept separate from runScraper so the latter stays a simple orchestrator.
+func buildScraperConfig(args arguments, cookies []scraper.Cookie) scraper.Config {
+	username, password := splitUserPassword(args.User)
+	return scraper.Config{
 		Includes: args.Include,
 		Excludes: args.Exclude,
 
-		ImageQuality: uint(imageQuality),
+		ImageQuality: clampImageQuality(args.ImageQuality),
 		MaxDepth:     uint(args.Depth),
 		Timeout:      uint(args.Timeout),
 
@@ -238,34 +254,21 @@ func runScraper(ctx context.Context, args arguments, logger *log.Logger) error {
 		SkipExternalResources: !args.IncludeExternal,
 		AllowCDN:              args.AllowCDN,
 
-		// Concurrency and rate limiting
 		Concurrency: args.Concurrency,
 		RateLimit:   args.RateLimit,
 		Delay:       uint(args.Delay),
 
-		// Progress and logging
 		// In TUI mode the dashboard owns the screen; the progressbar would
 		// fight it for stdout, so force-disable.
 		ShowProgress: !args.NoProgress && !args.TUI,
 		ErrorLogFile: args.ErrorLogFile,
 
-		// robots.txt
-		RespectRobots: args.RespectRobots,
-
-		// Skip 403
-		Skip403: args.Skip403,
-
-		// Default excludes
+		RespectRobots:          args.RespectRobots,
+		Skip403:                args.Skip403,
 		DisableDefaultExcludes: args.NoDefaultExcludes,
-
-		// Markdown mode
-		Markdown: args.Markdown,
-
-		// Skip existing
-		SkipExisting: args.SkipExisting,
+		Markdown:               args.Markdown,
+		SkipExisting:           args.SkipExisting,
 	}
-
-	return scrapeURLs(ctx, cfg, logger, args)
 }
 
 func scrapeURLs(ctx context.Context, cfg scraper.Config,
@@ -344,9 +347,9 @@ func runWithTUI(ctx context.Context, cfg scraper.Config,
 	// Run blocks until the TUI quits (user pressed q OR scraper finished
 	// and the auto-quit timer fired).
 	_, runErr := program.Run()
-	cancel()       // ensure scraper goroutine notices if user quit early
-	stopHandler()  // prevent Send-after-Run
-	<-doneCh       // wait for scraper to fully unwind before continuing
+	cancel()      // ensure scraper goroutine notices if user quit early
+	stopHandler() // prevent Send-after-Run
+	<-doneCh      // wait for scraper to fully unwind before continuing
 
 	if runErr != nil {
 		return fmt.Errorf("running TUI: %w", runErr)

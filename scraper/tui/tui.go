@@ -200,104 +200,122 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// applyEvent folds a single scraper event into the model. Complexity
-// scales with the event-kind switch; each branch is a coherent state
-// transition.
-//
-//nolint:cyclop,funlen // event-state-machine dispatch
+// applyEvent folds a single scraper event into the model by dispatching
+// to a per-kind handler. Each handler owns one coherent state transition.
 func (m Model) applyEvent(ev scraper.Event) Model {
 	switch ev.Kind {
 	case scraper.EventPageDiscovered:
 		m.ensurePageNode(ev.URL, ev.Parent, ev.Depth)
-
 	case scraper.EventPageStart:
-		node := m.ensurePageNode(ev.URL, "", ev.Depth)
-		node.status = statusDownloading
-		node.started = time.Now()
-		m.currentPage = ev.URL
-
+		m.onPageStart(ev)
 	case scraper.EventPageDone:
-		// When the scraper redirects the start URL, PageDone carries the
-		// post-redirect URL while the EventPageDiscovered we registered
-		// used the pre-redirect URL. Resolve to the active page so the
-		// status update lands on the right node.
-		target := ev.URL
-		if _, ok := m.pages[target]; !ok {
-			target = m.currentPage
-		}
-		if node := m.pages[target]; node != nil {
-			node.status = statusDone
-			node.finished = time.Now()
-			m.pagesOK++
-			m.recordCompleted(node)
-		}
-		if m.currentPage == ev.URL || m.currentPage == target {
-			m.currentPage = ""
-		}
-
+		m.onPageDone(ev)
 	case scraper.EventAssetStart:
-		m.inflightAssets[ev.URL] = time.Now()
-		if cp := m.pages[m.currentPage]; cp != nil {
-			cp.assetsInflight++
-		}
-
+		m.onAssetStart(ev)
 	case scraper.EventAssetDone:
-		delete(m.inflightAssets, ev.URL)
-		if cp := m.pages[m.currentPage]; cp != nil {
-			if cp.assetsInflight > 0 {
-				cp.assetsInflight--
-			}
-			cp.assetsOK++
-		}
-		m.assetsOK++
-
+		m.onAssetDone(ev)
 	case scraper.EventSkipped:
-		if node, ok := m.pages[ev.URL]; ok {
-			node.status = statusSkipped
-			node.finished = time.Now()
-			m.skipped++
-			m.recordCompleted(node)
-		} else {
-			delete(m.inflightAssets, ev.URL)
-			if cp := m.pages[m.currentPage]; cp != nil {
-				cp.assetsSkipped++
-			}
-			m.skipped++
-		}
-		m.recent = appendRecent(m.recent, recentEntry{
-			at: ev.Timestamp, kind: ev.Kind, url: ev.URL, message: ev.Message,
-		})
-
+		m.onSkipped(ev)
 	case scraper.EventFailed:
-		if node, ok := m.pages[ev.URL]; ok {
-			node.status = statusFailed
-			node.err = ev.Err
-			node.finished = time.Now()
-			m.pagesFailed++
-			m.recordCompleted(node)
-		} else {
-			delete(m.inflightAssets, ev.URL)
-			if cp := m.pages[m.currentPage]; cp != nil {
-				if cp.assetsInflight > 0 {
-					cp.assetsInflight--
-				}
-				cp.assetsFailed++
-			}
-			m.assetsFailed++
-		}
-		m.recent = appendRecent(m.recent, recentEntry{
-			at: ev.Timestamp, kind: ev.Kind, url: ev.URL, err: ev.Err,
-		})
-
+		m.onFailed(ev)
 	case scraper.EventQueueChanged:
 		m.queueSize = ev.QueueSize
-
 	case scraper.EventLog:
 		m.recent = appendRecent(m.recent, recentEntry{
 			at: ev.Timestamp, kind: ev.Kind, message: ev.Message,
 		})
 	}
 	return m
+}
+
+func (m *Model) onPageStart(ev scraper.Event) {
+	node := m.ensurePageNode(ev.URL, "", ev.Depth)
+	node.status = statusDownloading
+	node.started = time.Now()
+	m.currentPage = ev.URL
+}
+
+// onPageDone resolves the post-redirect URL when needed and closes out
+// the page node. When the scraper redirects the start URL, PageDone
+// carries the post-redirect URL while the original EventPageDiscovered
+// registered the pre-redirect URL — fall back to currentPage so the
+// status update lands on the right node.
+func (m *Model) onPageDone(ev scraper.Event) {
+	target := ev.URL
+	if _, ok := m.pages[target]; !ok {
+		target = m.currentPage
+	}
+	if node := m.pages[target]; node != nil {
+		node.status = statusDone
+		node.finished = time.Now()
+		m.pagesOK++
+		m.recordCompleted(node)
+	}
+	if m.currentPage == ev.URL || m.currentPage == target {
+		m.currentPage = ""
+	}
+}
+
+func (m *Model) onAssetStart(ev scraper.Event) {
+	m.inflightAssets[ev.URL] = time.Now()
+	if cp := m.pages[m.currentPage]; cp != nil {
+		cp.assetsInflight++
+	}
+}
+
+func (m *Model) onAssetDone(ev scraper.Event) {
+	delete(m.inflightAssets, ev.URL)
+	if cp := m.pages[m.currentPage]; cp != nil {
+		if cp.assetsInflight > 0 {
+			cp.assetsInflight--
+		}
+		cp.assetsOK++
+	}
+	m.assetsOK++
+}
+
+// onSkipped distinguishes a skipped page node (recorded in m.pages) from
+// a skipped asset (tracked under the current page's counters).
+func (m *Model) onSkipped(ev scraper.Event) {
+	if node, ok := m.pages[ev.URL]; ok {
+		node.status = statusSkipped
+		node.finished = time.Now()
+		m.skipped++
+		m.recordCompleted(node)
+	} else {
+		delete(m.inflightAssets, ev.URL)
+		if cp := m.pages[m.currentPage]; cp != nil {
+			cp.assetsSkipped++
+		}
+		m.skipped++
+	}
+	m.recent = appendRecent(m.recent, recentEntry{
+		at: ev.Timestamp, kind: ev.Kind, url: ev.URL, message: ev.Message,
+	})
+}
+
+// onFailed mirrors onSkipped but for failures: attributes the error to
+// either a known page node or to the asset counters of the current page.
+func (m *Model) onFailed(ev scraper.Event) {
+	if node, ok := m.pages[ev.URL]; ok {
+		node.status = statusFailed
+		node.err = ev.Err
+		node.finished = time.Now()
+		m.pagesFailed++
+		m.recordCompleted(node)
+	} else {
+		delete(m.inflightAssets, ev.URL)
+		if cp := m.pages[m.currentPage]; cp != nil {
+			if cp.assetsInflight > 0 {
+				cp.assetsInflight--
+			}
+			cp.assetsFailed++
+		}
+		m.assetsFailed++
+	}
+	m.recent = appendRecent(m.recent, recentEntry{
+		at: ev.Timestamp, kind: ev.Kind, url: ev.URL, err: ev.Err,
+	})
 }
 
 // recordCompleted appends the just-finished page node to the recent ring

@@ -172,8 +172,6 @@ func TestMarkdownSkipsCSSJS(t *testing.T) {
 </body>
 </html>
 `)
-
-	startURL := testStartURL
 	urls := map[string][]byte{
 		testStartURL:                    indexPage,
 		"https://example.org/style.css": []byte(`body{}`),
@@ -181,59 +179,51 @@ func TestMarkdownSkipsCSSJS(t *testing.T) {
 		"https://example.org/photo.jpg": []byte(`fake-jpg-data`),
 	}
 
+	files := runMarkdownScraperWithFixtures(t, urls)
+
+	assert.True(t, anyPathHasSuffix(files, ".jpg"), "images should be downloaded in markdown mode")
+	assert.False(t, anyPathHasSuffix(files, ".css"), "CSS should NOT be downloaded in markdown mode")
+	assert.False(t, anyPathHasSuffix(files, ".js"), "JS should NOT be downloaded in markdown mode")
+	assert.True(t, anyPathHasSuffix(files, ".md"), "markdown file should be written")
+}
+
+// runMarkdownScraperWithFixtures wires a Markdown-mode scraper backed by
+// an in-memory URL fixture map and returns the files captured by the
+// fileWriter shim.
+func runMarkdownScraperWithFixtures(t *testing.T, urls map[string][]byte) map[string][]byte {
+	t.Helper()
 	logger := log.NewTestLogger(t)
-	cfg := Config{
-		URL:      startURL,
-		Markdown: true,
-	}
-	scraper, err := New(logger, cfg)
+	s, err := New(logger, Config{URL: testStartURL, Markdown: true})
 	require.NoError(t, err)
 
-	scraper.dirCreator = func(_ string) error { return nil }
-	scraper.fileExistenceCheck = func(_ string) bool { return false }
+	s.dirCreator = func(_ string) error { return nil }
+	s.fileExistenceCheck = func(_ string) bool { return false }
 
 	files := map[string][]byte{}
-	scraper.fileWriter = func(filePath string, data []byte) error {
+	s.fileWriter = func(filePath string, data []byte) error {
 		files[filePath] = data
 		return nil
 	}
-	scraper.httpDownloader = func(_ context.Context, u *url.URL) ([]byte, *url.URL, error) {
-		ur := u.String()
-		b, ok := urls[ur]
-		if ok {
+	s.httpDownloader = func(_ context.Context, u *url.URL) ([]byte, *url.URL, error) {
+		if b, ok := urls[u.String()]; ok {
 			return b, u, nil
 		}
-		return nil, nil, fmt.Errorf("url '%s' not found in test data", ur)
+		return nil, nil, fmt.Errorf("url '%s' not found in test data", u.String())
 	}
 
-	ctx := context.Background()
-	err = scraper.Start(ctx)
-	require.NoError(t, err)
+	require.NoError(t, s.Start(context.Background()))
+	return files
+}
 
-	// Image should be downloaded
-	hasImage := false
-	hasCSS := false
-	hasJS := false
-	hasMarkdown := false
+// anyPathHasSuffix reports whether at least one captured file path ends
+// with the given suffix.
+func anyPathHasSuffix(files map[string][]byte, suffix string) bool {
 	for path := range files {
-		if strings.HasSuffix(path, ".jpg") {
-			hasImage = true
-		}
-		if strings.HasSuffix(path, ".css") {
-			hasCSS = true
-		}
-		if strings.HasSuffix(path, ".js") {
-			hasJS = true
-		}
-		if strings.HasSuffix(path, ".md") {
-			hasMarkdown = true
+		if strings.HasSuffix(path, suffix) {
+			return true
 		}
 	}
-
-	assert.True(t, hasImage, "images should be downloaded in markdown mode")
-	assert.False(t, hasCSS, "CSS should NOT be downloaded in markdown mode")
-	assert.False(t, hasJS, "JS should NOT be downloaded in markdown mode")
-	assert.True(t, hasMarkdown, "markdown file should be written")
+	return false
 }
 
 func TestMarkdownStoreDownload(t *testing.T) {
