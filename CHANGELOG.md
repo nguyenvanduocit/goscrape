@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.5.0] - 2026-05-25
+
+Added:
+
+* `--url-file` to read URLs to scrape from a file (one URL per line; blank lines and `#` comments ignored), merged and de-duplicated with positional URLs
+* `--no-follow` for allowlist scraping: download only the given URLs (and their page assets) without following `<a>` links
+* in `--no-follow` mode a URL list is best-effort — a failing URL is logged and skipped instead of aborting the whole batch
+
+Fixed:
+
+* write output directly under the `--output` directory instead of nesting it under the host directory
+
 ## [v0.3.0] - 2025-01-01
 
 Added:

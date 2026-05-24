@@ -90,6 +90,13 @@ type Config struct {
 	// where ?id=1 vs ?id=2 represent genuinely different content.
 	IncludeQueryInPath bool
 
+	// NoFollow disables link discovery: <a> hyperlinks are not queued, so only
+	// the explicitly provided start URL is downloaded. Page assets (images, CSS,
+	// JS) referenced by that page are still fetched so the page renders offline.
+	// Used for allowlist-style scraping where the caller supplies an exact set
+	// of URLs and does not want the crawler to wander beyond them.
+	NoFollow bool
+
 	// OnEvent is an optional consumer callback for scraping lifecycle events.
 	// When set, the scraper emits events for page/asset downloads, skips, and
 	// failures. Handlers MUST be non-blocking — they run on the scraper goroutine.
@@ -578,6 +585,11 @@ func (s *Scraper) adoptStartPageRedirect(original, respURL *url.URL) *url.URL {
 // The MaxDepth check fires inside shouldURLBeDownloaded, so we don't need
 // to gate the loop here.
 func (s *Scraper) queueChildPages(index *htmlindex.Index, parent *url.URL, currentDepth uint) bool {
+	// NoFollow: download only the given URLs, never their hyperlinks. Assets
+	// are queued separately via submitReferences, so they are unaffected.
+	if s.config.NoFollow {
+		return false
+	}
 	references, err := index.URLs(htmlindex.ATag)
 	if err != nil {
 		s.logger.Error("Parsing URL failed", log.Err(err))

@@ -96,6 +96,54 @@ func TestScraperLinks(t *testing.T) {
 	assert.Equal(t, expectedProcessed, scraper.processed)
 }
 
+// TestNoFollow_DownloadsAssetsButNotLinks verifies the allowlist behaviour:
+// with NoFollow the start page and its assets (CSS, image) are downloaded, but
+// <a> hyperlink targets are never queued, so the crawl does not wander.
+func TestNoFollow_DownloadsAssetsButNotLinks(t *testing.T) {
+	indexPage := []byte(`
+<html>
+<head><link href="https://example.org/style.css" rel="stylesheet" type="text/css"></head>
+<body>
+<img src="https://example.org/pic.png">
+<a href="https://example.org/page2">link</a>
+</body>
+</html>
+`)
+
+	startURL := testStartURL
+	urls := map[string][]byte{
+		testStartURL:                    indexPage,
+		"https://example.org/style.css": []byte(``),
+		"https://example.org/pic.png":   []byte(``),
+		"https://example.org/page2":     []byte(`<html><body>page2</body></html>`),
+	}
+
+	logger := log.NewTestLogger(t)
+	cfg := Config{URL: startURL, NoFollow: true}
+	s, err := New(logger, cfg)
+	require.NoError(t, err)
+
+	s.dirCreator = func(_ string) error { return nil }
+	s.fileWriter = func(_ string, _ []byte) error { return nil }
+	s.fileExistenceCheck = func(_ string) bool { return false }
+	s.httpDownloader = func(_ context.Context, u *url.URL) ([]byte, *url.URL, error) {
+		ur := u.String()
+		if b, ok := urls[ur]; ok {
+			return b, u, nil
+		}
+		return nil, nil, fmt.Errorf("url '%s' not found in test data", ur)
+	}
+
+	require.NoError(t, s.Start(context.Background()))
+
+	// Start page and its page assets are fetched so the page renders offline.
+	assert.True(t, s.processed.Contains("/"), "start page should be processed")
+	assert.True(t, s.processed.Contains("/style.css"), "CSS asset should be downloaded")
+	assert.True(t, s.processed.Contains("/pic.png"), "image asset should be downloaded")
+	// The hyperlink target must NOT be followed.
+	assert.False(t, s.processed.Contains("/page2"), "no-follow must not queue hyperlink targets")
+}
+
 func TestScraperAttributes(t *testing.T) {
 	indexPage := []byte(`
 <html>

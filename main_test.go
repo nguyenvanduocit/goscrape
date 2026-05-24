@@ -2,6 +2,8 @@ package main
 
 import (
 	"math"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -88,4 +90,60 @@ func TestValidateArguments_AcceptsBoundary(t *testing.T) {
 		RateLimit:   maxRateLimit,
 	}
 	require.NoError(t, validateArguments(&args))
+}
+
+// TestReadURLFile_SkipsBlankAndComments — one URL per line, with whitespace
+// trimmed; blank lines and #-comment lines (even indented) are ignored.
+func TestReadURLFile_SkipsBlankAndComments(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "urls.txt")
+	content := "https://a.example/1\n" +
+		"  \n" +
+		"# a comment\n" +
+		"  https://a.example/2  \n" +
+		"\t# indented comment\n" +
+		"https://a.example/3\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0600))
+
+	urls, err := readURLFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, []string{
+		"https://a.example/1",
+		"https://a.example/2",
+		"https://a.example/3",
+	}, urls)
+}
+
+// TestReadURLFile_MissingFile — a missing file is a hard error with an
+// actionable message, not a silent empty list.
+func TestReadURLFile_MissingFile(t *testing.T) {
+	_, err := readURLFile(filepath.Join(t.TempDir(), "does-not-exist.txt"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reading url file")
+}
+
+// TestMergeURLSources_DedupesPositionalAndFile — file URLs append to
+// positional URLs and duplicates collapse, preserving first-seen order.
+func TestMergeURLSources_DedupesPositionalAndFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "urls.txt")
+	require.NoError(t, os.WriteFile(path,
+		[]byte("https://a.example/2\nhttps://a.example/3\n"), 0600))
+
+	args := arguments{
+		URLs:    []string{"https://a.example/1", "https://a.example/2"},
+		URLFile: path,
+	}
+	require.NoError(t, mergeURLSources(&args))
+	assert.Equal(t, []string{
+		"https://a.example/1",
+		"https://a.example/2",
+		"https://a.example/3",
+	}, args.URLs)
+}
+
+// TestMergeURLSources_NoFile_Unchanged — without --url-file the positional
+// URLs are left exactly as-is.
+func TestMergeURLSources_NoFile_Unchanged(t *testing.T) {
+	args := arguments{URLs: []string{"https://a.example/1"}}
+	require.NoError(t, mergeURLSources(&args))
+	assert.Equal(t, []string{"https://a.example/1"}, args.URLs)
 }

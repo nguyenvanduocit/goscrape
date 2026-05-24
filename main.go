@@ -32,6 +32,11 @@ type arguments struct {
 	Output  string   `arg:"-o,--output" help:"output directory to write files to"`
 	URLs    []string `arg:"positional"`
 
+	// Allowlist scraping: feed an exact set of URLs and optionally disable
+	// link discovery so only those URLs (plus their page assets) are saved.
+	URLFile  string `arg:"-f,--url-file" help:"read URLs to scrape from a file (one URL per line; blank lines and lines starting with # are ignored). Merged with positional URLs"`
+	NoFollow bool   `arg:"--no-follow" help:"do not follow <a> links; download only the given URLs (positional and/or --url-file). Page assets are still downloaded"`
+
 	Depth        int64 `arg:"-d,--depth" help:"download depth, 0 for unlimited" default:"10"`
 	ImageQuality int64 `arg:"-i,--imagequality" help:"image quality, 0 to disable reencoding"`
 	Timeout      int64 `arg:"-t,--timeout" help:"time limit in seconds for each HTTP request to connect and read the request body"`
@@ -168,12 +173,68 @@ func readArguments() (arguments, error) {
 		return arguments{}, err
 	}
 
+	// Merge --url-file into the positional URLs before the empty-check so a
+	// file-only invocation (no positional URLs) still proceeds to scrape.
+	if err := mergeURLSources(&args); err != nil {
+		return arguments{}, err
+	}
+
 	if len(args.URLs) == 0 && args.Serve == "" {
 		parser.WriteHelp(os.Stdout)
 		os.Exit(0)
 	}
 
 	return args, nil
+}
+
+// mergeURLSources reads URLs from --url-file (when set) and merges them with
+// the positional URLs, de-duplicating while preserving first-seen order so a
+// URL listed twice (or in both sources) is scraped once. Positional URLs come
+// first, then file URLs.
+func mergeURLSources(args *arguments) error {
+	if args.URLFile == "" {
+		return nil
+	}
+	fileURLs, err := readURLFile(args.URLFile)
+	if err != nil {
+		return err
+	}
+	args.URLs = dedupeStrings(append(args.URLs, fileURLs...))
+	return nil
+}
+
+// readURLFile parses a URL list file: one URL per line, with surrounding
+// whitespace trimmed. Blank lines and lines whose first non-space character
+// is '#' are treated as comments and skipped.
+func readURLFile(path string) ([]string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading url file %q: %w", path, err)
+	}
+	var urls []string
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		urls = append(urls, line)
+	}
+	return urls, nil
+}
+
+// dedupeStrings returns the input with duplicates removed, preserving the
+// order of first occurrence.
+func dedupeStrings(in []string) []string {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
 }
 
 // Argument bounds — picked to catch obviously broken input without
@@ -327,12 +388,14 @@ func buildScraperConfig(args arguments, cookies []scraper.Cookie) scraper.Config
 		Markdown:               args.Markdown,
 		SkipExisting:           args.SkipExisting,
 		IncludeQueryInPath:     args.IncludeQuery,
+		NoFollow:               args.NoFollow,
 	}
 }
 
 func scrapeURLs(ctx context.Context, cfg scraper.Config,
 	logger *log.Logger, args arguments) error {
 
+	var failed int
 	for _, url := range args.URLs {
 		cfg.URL = url
 
@@ -342,12 +405,29 @@ func scrapeURLs(ctx context.Context, cfg scraper.Config,
 		} else {
 			runErr = runScrape(ctx, cfg, logger, args)
 		}
-		if runErr != nil {
-			if errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
-				os.Exit(0)
-			}
+		if runErr == nil {
+			continue
+		}
+		if errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
+			os.Exit(0)
+		}
+		// In allowlist mode (--no-follow) a URL list is best-effort: one bad
+		// URL (403, network error, ...) must not abort the rest of the list,
+		// since the whole point is to fetch every URL the caller listed.
+		// Normal crawl mode keeps fail-fast — there a failing start URL means
+		// the crawl can't proceed.
+		if !args.NoFollow {
 			return runErr
 		}
+		logger.Error("Skipping failed URL",
+			log.String("url", url),
+			log.Err(runErr))
+		failed++
+	}
+	if failed > 0 {
+		logger.Warn("Completed with failures",
+			log.Int("failed", failed),
+			log.Int("total", len(args.URLs)))
 	}
 	return nil
 }
