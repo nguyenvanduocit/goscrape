@@ -15,24 +15,34 @@ func TestGetFilePath(t *testing.T) {
 	type filePathFixture struct {
 		BaseURL          string
 		DownloadURL      string
+		OutputDirectory  string
 		ExpectedFilePath string
 	}
 
 	pathSeparator := string(os.PathSeparator)
 	expectedBasePath := "google.com" + pathSeparator
 	var fixtures = []filePathFixture{
-		{"https://google.com/", "https://github.com/", expectedBasePath + "_github.com" + pathSeparator + "index.html"},
-		{"https://google.com/", "https://github.com/#fragment", expectedBasePath + "_github.com" + pathSeparator + "index.html"},
-		{"https://google.com/", "https://github.com/test", expectedBasePath + "_github.com" + pathSeparator + "test.html"},
-		{"https://google.com/", "https://github.com/test/", expectedBasePath + "_github.com" + pathSeparator + "test" + pathSeparator + "index.html"},
-		{"https://google.com/", "https://github.com/test.aspx", expectedBasePath + "_github.com" + pathSeparator + "test.aspx"},
-		{"https://google.com/", "https://google.com/settings", expectedBasePath + "settings.html"},
+		// No output directory — domain becomes root folder
+		{"https://google.com/", "https://github.com/", "", expectedBasePath + "_github.com" + pathSeparator + "index.html"},
+		{"https://google.com/", "https://github.com/#fragment", "", expectedBasePath + "_github.com" + pathSeparator + "index.html"},
+		{"https://google.com/", "https://github.com/test", "", expectedBasePath + "_github.com" + pathSeparator + "test.html"},
+		{"https://google.com/", "https://github.com/test/", "", expectedBasePath + "_github.com" + pathSeparator + "test" + pathSeparator + "index.html"},
+		{"https://google.com/", "https://github.com/test.aspx", "", expectedBasePath + "_github.com" + pathSeparator + "test.aspx"},
+		{"https://google.com/", "https://google.com/settings", "", expectedBasePath + "settings.html"},
+
+		// With output directory — content goes directly into output dir, no domain subfolder
+		{"https://google.com/", "https://google.com/", "mydir", "mydir" + pathSeparator + "index.html"},
+		{"https://google.com/", "https://google.com/settings", "mydir", "mydir" + pathSeparator + "settings.html"},
+		{"https://google.com/", "https://github.com/style.css", "mydir", "mydir" + pathSeparator + "_github.com" + pathSeparator + "style.css"},
+		{"https://google.com/", "https://google.com/assets/logo.png", "out", "out" + pathSeparator + "assets" + pathSeparator + "logo.png"},
 	}
 
-	var cfg Config
 	logger := log.NewTestLogger(t)
 	for _, fix := range fixtures {
-		cfg.URL = fix.BaseURL
+		cfg := Config{
+			URL:             fix.BaseURL,
+			OutputDirectory: fix.OutputDirectory,
+		}
 		s, err := New(logger, cfg)
 		require.NoError(t, err)
 
@@ -42,6 +52,22 @@ func TestGetFilePath(t *testing.T) {
 		output := s.getFilePath(URL, true)
 		assert.Equal(t, fix.ExpectedFilePath, output)
 	}
+}
+
+func TestGetFilePath_TraversalWithOutputDir(t *testing.T) {
+	logger := log.NewTestLogger(t)
+	s, err := New(logger, Config{
+		URL:             "https://example.com",
+		OutputDirectory: "mydir",
+	})
+	require.NoError(t, err)
+
+	u, err := url.Parse("https://example.com/../../etc/passwd")
+	require.NoError(t, err)
+
+	result := s.getFilePath(u, false)
+	assert.Contains(t, result, "mydir", "path must stay under output directory")
+	assert.Contains(t, result, "invalid_path", "traversal attempt must be caught")
 }
 
 func TestTruncateFilename(t *testing.T) {

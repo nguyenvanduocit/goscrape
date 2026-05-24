@@ -180,14 +180,20 @@ func (s *Scraper) getFilePath(url *url.URL, isHTML bool) string {
 		fileName = filepath.Join(dir, truncatedBase)
 	}
 
-	result := filepath.Join(s.config.OutputDirectory, s.URL.Host, externalHost, fileName)
+	var result, outputRoot string
+	if s.config.OutputDirectory != "" {
+		result = filepath.Join(s.config.OutputDirectory, externalHost, fileName)
+		outputRoot = s.config.OutputDirectory
+	} else {
+		result = filepath.Join(s.URL.Host, externalHost, fileName)
+		outputRoot = s.URL.Host
+	}
 
 	// Disambiguate case-insensitive collisions BEFORE the traversal guard so
 	// the guard sees the final path.
 	result = s.disambiguateCaseCollision(result, url)
 
 	// Guard against path traversal: ensure final path stays under the output root
-	outputRoot := filepath.Join(s.config.OutputDirectory, s.URL.Host)
 	absResult, err := filepath.Abs(result)
 	if err != nil {
 		return filepath.Join(outputRoot, "invalid_path")

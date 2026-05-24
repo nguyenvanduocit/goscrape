@@ -23,10 +23,6 @@ func (s *Scraper) createDownloadPath(path string) error {
 
 func (s *Scraper) writeFile(filePath string, data []byte) error {
 	dir := filepath.Dir(filePath)
-	if len(dir) < len(s.URL.Host) { // nothing to append if it is the root dir
-		dir = filepath.Join(".", s.URL.Host, dir)
-	}
-
 	if err := s.dirCreator(dir); err != nil {
 		return err
 	}
